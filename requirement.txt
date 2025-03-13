@@ -1,1 +1,3 @@
 uv
+flask
+ninja

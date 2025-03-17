@@ -1,0 +1,4 @@
+huggingface:
+  loginToken: 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
+vllm:
+  tensor_parallel_size: 1

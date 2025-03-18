@@ -57,7 +57,7 @@ class VLLMServer:
         cuda_env = ''
         if cuda:
             cuda_env = f'CUDA_VISIBLE_DEVICES={','.join(str(gpu) for gpu in cuda)}'
-        cmd = ['vllm', 'serve', model_name]
+        cmd = ['vllm', 'serve', model_name, '--enable-auto-tool-choice']
         for k, v in vllm_config.items():
             if isinstance(v, bool) and v:
                 cmd.append(f'--{k}')

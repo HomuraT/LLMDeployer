@@ -2,6 +2,7 @@
 - 自动选择空闲gpu
 - 通过端口转发的方式同时与多个llm通讯
 - llm特定时间没有交互自动关闭，释放资源
+- 通过输入输出切换适配open的function calling接口
 
 # install
 [SGL install document](https://docs.sglang.ai/start/install.html)

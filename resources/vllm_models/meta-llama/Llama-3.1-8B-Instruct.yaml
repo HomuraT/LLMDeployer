@@ -2,3 +2,5 @@ huggingface:
   loginToken: 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
 vllm:
   tensor_parallel_size: 1
+  max_model_len: 41216
+  gpu_memory_utilization: 0.9

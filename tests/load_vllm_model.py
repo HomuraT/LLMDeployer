@@ -1,6 +1,8 @@
+from vllm import RequestOutput
+
 from src.utils.enviroment_utils import huggingface_use_domestic_endpoint
 huggingface_use_domestic_endpoint()
-
+RequestOutput
 from src.models.vllm_loader import load_model
 
 

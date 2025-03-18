@@ -1,13 +1,15 @@
 import time
 
 from src.utils.enviroment_utils import huggingface_use_domestic_endpoint, set_python_path
+from src.utils.gpu_utils import find_available_gpu
+
 huggingface_use_domestic_endpoint()
 set_python_path()
 
 from src.models.vllm_loader import load_model, VLLMServer
 import threading
 
-llm = VLLMServer("Qwen/Qwen2.5-7B-Instruct", cuda=[1])
+llm = VLLMServer("meta-llama/Llama-3.1-8B-Instruct", cuda=find_available_gpu())
 conversation = [
     {
         "role": "system",

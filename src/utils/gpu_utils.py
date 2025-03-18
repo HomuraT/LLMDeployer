@@ -1,7 +1,7 @@
 import re
 import subprocess
 
-def find_available_gpu(model_name=None, min_memory_mb=16000):
+def find_available_gpu(model_name=None, min_memory_mb=24000):
     """
     Find an available GPU based on free memory, optionally adjusting min_memory_mb if model is small/large.
     """
@@ -29,16 +29,16 @@ def find_available_gpu(model_name=None, min_memory_mb=16000):
 
         free_memory = [int(x) for x in result.stdout.strip().split('\n')]
         max_memory = -1
-        selected_gpu = None
+        selected_gpus = []
 
         for i, mem in enumerate(free_memory):
-            if mem >= min_memory_mb and mem > max_memory:
+            if mem >= min_memory_mb and mem >= max_memory:
                 max_memory = mem
-                selected_gpu = i
+                selected_gpus.append(i)
 
-        if selected_gpu is not None:
-            print(f"GPU {selected_gpu} has enough memory: {max_memory} MB free.")
-            return selected_gpu
+        if selected_gpus:
+            print(f"GPU {selected_gpus} has enough memory: {max_memory} MB free.")
+            return selected_gpus
         else:
             print(f"No GPU found with minimum memory of {min_memory_mb} MB free.")
             return None

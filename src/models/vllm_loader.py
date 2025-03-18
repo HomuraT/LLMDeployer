@@ -20,7 +20,6 @@ def load_model(model_name:str, vllm_config=None)->LLM:
         huggingface_config = config['huggingface']
         if 'loginToken' in huggingface_config:
             login(huggingface_config['loginToken'])
-
     if 'vllm' in config:
         if vllm_config:
             vllm_config = config['vllm'].update(vllm_config)
@@ -31,7 +30,7 @@ def load_model(model_name:str, vllm_config=None)->LLM:
     return llm
 
 class VLLMServer:
-    def __init__(self, model_name: str, vllm_config=None, cuda=None):
+    def __init__(self, model_name: str, vllm_config:dict[str, any]=None, cuda:list=None):
         if vllm_config is None:
             vllm_config = {}
 
@@ -48,28 +47,32 @@ class VLLMServer:
             s.close()
             vllm_config['port'] = free_port
 
-        self.model_name = model_name
+        if 'model_name' in vllm_config:
+            self.model_name = vllm_config['model_name']
+        else:
+            self.model_name = model_name
         self.port = vllm_config['port']
 
         # Build command
+        cuda_env = ''
         if cuda:
-            cuda_env = f"CUDA_VISIBLE_DEVICES={','.join(str(gpu) for gpu in cuda)}"
-        cmd = ["vllm", "serve", model_name]
+            cuda_env = f'CUDA_VISIBLE_DEVICES={','.join(str(gpu) for gpu in cuda)}'
+        cmd = ['vllm', 'serve', model_name]
         for k, v in vllm_config.items():
             if isinstance(v, bool) and v:
-                cmd.append(f"--{k}")
+                cmd.append(f'--{k}')
             else:
-                cmd.append(f"--{k}")
+                cmd.append(f'--{k}')
                 cmd.append(str(v))
 
-        cmd_str = " ".join(cmd)
+        cmd_str = ' '.join(cmd)
         cmd_str = cuda_env + ' ' + cmd_str
         # Start process
         self.process = subprocess.Popen(cmd_str, shell=True)
         self.pid = self.process.pid
 
         # Wait until the port can respond
-        url = f"http://127.0.0.1:{self.port}/v1/models"
+        url = f'http://127.0.0.1:{self.port}/v1/models'
         for _ in tqdm(range(3000), desc='wait for model loading'):
             try:
                 r = requests.get(url, timeout=1)
@@ -80,15 +83,15 @@ class VLLMServer:
             time.sleep(1)
 
         self.client = OpenAI(
-            base_url=f"http://localhost:{self.port}/v1",
-            api_key="null",
+            base_url=f'http://localhost:{self.port}/v1',
+            api_key='null',
         )
 
     def chat(self, messages, **kwargs):
-        """
+        '''
         Sends a chat request to the local vLLM server.
         Adjust parameters as you like.
-        """
+        '''
         payload = kwargs
         payload['messages'] = messages
         payload['model'] = self.model_name
@@ -96,7 +99,7 @@ class VLLMServer:
         return resp
 
     def kill_server(self):
-        """
+        '''
         Terminates the child process.
-        """
+        '''
         self.process.terminate()

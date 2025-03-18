@@ -1,3 +1,8 @@
+# 开源llm便捷部署框架
+- 自动选择空闲gpu
+- 通过端口转发的方式同时与多个llm通讯
+- llm特定时间没有交互自动关闭，释放资源
+
 # install
 [SGL install document](https://docs.sglang.ai/start/install.html)
 ```

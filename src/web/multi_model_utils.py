@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 from datetime import datetime, timedelta
@@ -11,7 +12,7 @@ from src.utils.gpu_utils import find_available_gpu
 
 model_pool = {}
 model_pool_lock = threading.Lock()
-IDLE_TIMEOUT = timedelta(minutes=30)
+IDLE_TIMEOUT = timedelta(minutes=10)
 
 def get_or_create_model(model_name: str)->VLLMServer:
     """

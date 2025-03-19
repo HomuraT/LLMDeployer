@@ -1,8 +1,11 @@
+import logging
 import os
+import signal
 import subprocess
 import socket
 import time
 
+import psutil
 import requests
 from huggingface_hub import login
 from openai import OpenAI
@@ -10,7 +13,9 @@ from tqdm import tqdm
 from vllm import LLM
 
 from src.utils.config_utils import VLLM_MODEL_CONFIG_BASE_PATH
+from src.utils.process_utils import get_pid_by_grep
 from src.utils.yaml_utils import YAMLConfigManager
+logging.basicConfig(level=logging.INFO)
 
 def load_model(model_name:str, vllm_config=None)->LLM:
     if vllm_config is None:
@@ -28,6 +33,7 @@ def load_model(model_name:str, vllm_config=None)->LLM:
 
     llm = LLM(model=model_name, **vllm_config)
     return llm
+
 
 class VLLMServer:
     def __init__(self, model_name: str, vllm_config:dict[str, any]=None, cuda:list=None):
@@ -69,11 +75,10 @@ class VLLMServer:
         cmd_str = cuda_env + ' ' + cmd_str
         # Start process
         self.process = subprocess.Popen(cmd_str, shell=True)
-        self.pid = self.process.pid
 
         # Wait until the port can respond
         url = f'http://127.0.0.1:{self.port}/v1/models'
-        for _ in tqdm(range(3000), desc='wait for model loading'):
+        for _ in range(3000):
             try:
                 r = requests.get(url, timeout=1)
                 if r.status_code == 200:
@@ -86,6 +91,9 @@ class VLLMServer:
             base_url=f'http://localhost:{self.port}/v1',
             api_key='null',
         )
+
+        self.pid = get_pid_by_grep(cmd_str)+1
+        logging.info(f'{self.model_name} start at pid: {self.pid}')
 
     def chat(self, messages, **kwargs):
         '''
@@ -100,6 +108,15 @@ class VLLMServer:
 
     def kill_server(self):
         '''
-        Terminates the child process.
+        Terminates the child process and its child processes.
         '''
-        self.process.terminate()
+        try:
+            parent = psutil.Process(self.pid)
+            # Recursively terminate all child processes
+            for child in parent.children(recursive=True):
+                child.kill()
+            # Terminate the parent process
+            parent.kill()
+            logging.info(f'{self.model_name} terminated')
+        except psutil.NoSuchProcess:
+            logging.warning(f'Process with pid {self.pid} does not exist.')

@@ -2,7 +2,7 @@ import argparse
 import threading
 
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, Response, jsonify
 from pandas.tests.io.formats.test_to_html import justify
 from rich.console import Console
 
@@ -14,28 +14,38 @@ console = Console()
 @app.route('/generate', methods=['POST'])
 @app.route('/v1/chat/completions', methods=['POST'])
 def generate():
-    """Endpoint for proxying text-generation requests to another service."""
     data = request.json
     model_name = data['model']
     llm = get_or_create_model(model_name)
     forward_url = f"http://127.0.0.1:{llm.port}/v1/chat/completions"
 
     if 'functions' in data and data['functions']:
-        # Variable conversion adaptation of functions calling to open AI input format
-        data['tools'] = [{'type':'function', 'function': i} for i in data['functions']]
+        data['tools'] = [{'type':'function', 'function': f} for f in data['functions']]
         data['tool_choice'] = data['function_call']
 
-    response = requests.post(forward_url, json=data)
+    if data.get('stream'):
+        forward_response = requests.post(forward_url, json=data, stream=True)
 
-    if 'functions' in data and data['functions']:
-        # Adapting the variable conversion of functions calling to the output format of open AI
-        response_json = response.json()
-        response_json['choices'][0]['message']['function_call'] = response_json['choices'][0]['message']['tool_calls'][0]['function']
-        del response_json['choices'][0]['message']['tool_calls']
-        response_bytes = jsonify(response_json).get_data()
-        return response_bytes, response.status_code, response.headers.items()
+        def event_stream():
+            for chunk in forward_response.iter_content(chunk_size=None):
+                if chunk:
+                    yield chunk
 
-    return response.content, response.status_code, response.headers.items()
+        return Response(event_stream(), content_type='application/json')
+    else:
+        forward_response = requests.post(forward_url, json=data)
+        if 'functions' in data and data['functions']:
+            response_json = forward_response.json()
+            if response_json['choices'][0]['message']['tool_calls']:
+                response_json['choices'][0]['message']['function_call'] = \
+                    response_json['choices'][0]['message']['tool_calls'][0]['function']
+            else:
+                response_json['choices'][0]['message']['function_call'] = {}
+            del response_json['choices'][0]['message']['tool_calls']
+            return jsonify(response_json), forward_response.status_code, forward_response.headers.items()
+
+        return forward_response.content, forward_response.status_code, forward_response.headers.items()
+
 
 def run():
     """CLI entrypoint to run the Flask App."""

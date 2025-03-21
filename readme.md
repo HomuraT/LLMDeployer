@@ -19,3 +19,7 @@ conda install ninja
 python -m pip uninstall torch torchvision torchaudio
 python -m pip install --pre torch torchvision torchaudio 
 ```
+
+# todo
+- 嵌入模型
+- 多模态模型

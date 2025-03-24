@@ -1,4 +1,5 @@
 import argparse
+import logging
 import threading
 
 import requests
@@ -15,13 +16,10 @@ console = Console()
 @app.route('/v1/chat/completions', methods=['POST'])
 def generate():
     data = request.json
+    logging.info('收到消息：'+str(data))
     model_name = data['model']
     llm = get_or_create_model(model_name)
     forward_url = f"http://127.0.0.1:{llm.port}/v1/chat/completions"
-
-    if 'functions' in data and data['functions']:
-        data['tools'] = [{'type':'function', 'function': f} for f in data['functions']]
-        data['tool_choice'] = data['function_call']
 
     if data.get('stream'):
         forward_response = requests.post(forward_url, json=data, stream=True)
@@ -34,16 +32,6 @@ def generate():
         return Response(event_stream(), content_type='application/json')
     else:
         forward_response = requests.post(forward_url, json=data)
-        if 'functions' in data and data['functions']:
-            response_json = forward_response.json()
-            if response_json['choices'][0]['message']['tool_calls']:
-                response_json['choices'][0]['message']['function_call'] = \
-                    response_json['choices'][0]['message']['tool_calls'][0]['function']
-            else:
-                response_json['choices'][0]['message']['function_call'] = {}
-            del response_json['choices'][0]['message']['tool_calls']
-            return jsonify(response_json), forward_response.status_code, forward_response.headers.items()
-
         return forward_response.content, forward_response.status_code, forward_response.headers.items()
 
 

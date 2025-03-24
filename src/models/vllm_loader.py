@@ -92,7 +92,8 @@ class VLLMServer:
             api_key='null',
         )
 
-        self.pid = get_pid_by_grep(cmd_str)+1
+        # self.pid = get_pid_by_grep(cmd_str)+1
+        self.pid = self.process.pid
         logging.info(f'{self.model_name} start at pid: {self.pid}')
 
     def chat(self, messages, **kwargs):

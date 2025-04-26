@@ -16,7 +16,7 @@ console = Console()
 @app.route('/v1/chat/completions', methods=['POST'])
 def generate():
     data = request.json
-    logging.info('收到消息：'+str(data))
+    # logging.info('收到消息：'+str(data))
     model_name = data['model']
     llm = get_or_create_model(model_name)
     forward_url = f"http://127.0.0.1:{llm.port}/v1/chat/completions"

@@ -40,7 +40,23 @@ class VLLMServer:
         if vllm_config is None:
             vllm_config = {}
 
-        config = YAMLConfigManager.read_yaml(os.path.join(VLLM_MODEL_CONFIG_BASE_PATH, model_name + '.yaml'))
+        yaml_path = os.path.join(VLLM_MODEL_CONFIG_BASE_PATH, model_name + '.yaml')
+        if not os.path.exists(yaml_path):
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(yaml_path), exist_ok=True)
+            # Create default config
+            default_config = {
+                'vllm': {
+                    'tensor_parallel_size': 1,
+                    'tool-call-parser': 'hermes'
+                }
+            }
+            # Write the default config to the YAML file
+            YAMLConfigManager.write_yaml(yaml_path, default_config)
+            config = default_config
+        else:
+            config = YAMLConfigManager.read_yaml(yaml_path)
+
         if 'vllm' in config:
             config['vllm'].update(vllm_config)
             vllm_config = config['vllm']

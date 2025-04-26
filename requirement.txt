@@ -1,3 +1,6 @@
 uv
 flask
 ninja
+pytest
+rich
+vllm

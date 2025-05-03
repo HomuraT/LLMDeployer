@@ -10,4 +10,4 @@ def huggingface_use_domestic_endpoint()->None:
     os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
 def set_python_path():
-    os.environ["PATH"] = f"/home/renlin/miniconda3/envs/llmder/bin:{os.environ['PATH']}"
+    os.environ["PATH"] = f"/home/renlin/miniconda3/envs/LLMDeployer/bin:{os.environ['PATH']}"

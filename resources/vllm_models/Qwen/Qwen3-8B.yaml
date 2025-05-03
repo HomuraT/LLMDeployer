@@ -1,0 +1,2 @@
+vllm:
+    tensor_parallel_size: 1

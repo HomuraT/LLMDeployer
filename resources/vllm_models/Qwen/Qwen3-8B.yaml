@@ -1,2 +1,6 @@
 vllm:
     tensor_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    tool-call-parser: hermes
+    dtype: bfloat16
+    max_model_len: 8192

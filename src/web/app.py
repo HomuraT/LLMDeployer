@@ -16,6 +16,8 @@ console = Console()
 
 logging.basicConfig(level=logging.INFO) # Ensure logging is configured
 
+requests_time_out = 1200
+
 @app.route('/generate', methods=['POST'])
 @app.route('/v1/chat/completions', methods=['POST'])
 def generate():
@@ -45,7 +47,7 @@ def generate():
 
         try:
             if is_stream:
-                forward_response = requests.post(forward_url, json=data, stream=True, timeout=600) # Added timeout
+                forward_response = requests.post(forward_url, json=data, stream=True, timeout=requests_time_out) # Added timeout
                 forward_response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
 
                 def event_stream():
@@ -66,7 +68,7 @@ def generate():
                 content_type = forward_response.headers.get('content-type', 'application/json')
                 return Response(event_stream(), content_type=content_type)
             else:
-                forward_response = requests.post(forward_url, json=data, timeout=600) # Added timeout
+                forward_response = requests.post(forward_url, json=data, timeout=requests_time_out) # Added timeout
                 forward_response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
                 # Forward the exact response from the vLLM server
                 return forward_response.content, forward_response.status_code, forward_response.headers.items()

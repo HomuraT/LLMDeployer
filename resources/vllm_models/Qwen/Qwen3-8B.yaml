@@ -4,3 +4,5 @@ vllm:
     tool-call-parser: hermes
     dtype: bfloat16
     max_model_len: 16000
+    model: ~/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
+    served-model-name: Qwen/Qwen3-8B

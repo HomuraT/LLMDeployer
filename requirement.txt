@@ -4,3 +4,7 @@ ninja
 pytest
 rich
 vllm
+requests
+psutil
+nvidia-ml-py
+FlashInfer>=v0.2.3

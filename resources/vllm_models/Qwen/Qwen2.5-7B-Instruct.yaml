@@ -1,3 +1,5 @@
 vllm:
-  tensor_parallel_size: 1
+  tensor_parallel_size: 2
   tool-call-parser: hermes
+  model: ~/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
+  served-model-name: Qwen/Qwen2.5-7B-Instruct

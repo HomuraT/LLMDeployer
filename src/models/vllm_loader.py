@@ -5,6 +5,7 @@ import subprocess
 import socket
 import time
 import threading
+import datetime # Ensure datetime is imported early for logging setup
 # Add imports for prctl
 import ctypes
 import platform # To check OS
@@ -23,7 +24,23 @@ except ImportError:
 from src.utils.config_utils import VLLM_MODEL_CONFIG_BASE_PATH
 from src.utils.process_utils import get_pid_by_grep
 from src.utils.yaml_utils import YAMLConfigManager
-logging.basicConfig(level=logging.INFO)
+
+# --- Setup file logging ---
+log_dir = os.path.join(os.getcwd(), "logs")
+os.makedirs(log_dir, exist_ok=True)
+log_filename = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".log"
+log_filepath = os.path.join(log_dir, log_filename)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_filepath),
+        logging.StreamHandler() # Keep logging to console as well
+    ]
+)
+logging.info(f"Logging configured. Log file: {log_filepath}")
+# --- End logging setup ---
 
 # --- Additions for preexec_fn ---
 IS_LINUX = platform.system() == "Linux"
@@ -192,7 +209,7 @@ class VLLMServer:
             if 'port' not in vllm_config or self.port is None: # Also find new port if previous start failed
                 try:
                     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                        s.bind(('127.0.0.1', 0))
+                        s.bind(('localhost', 0))
                         free_port = s.getsockname()[1]
                     vllm_config['port'] = free_port
                     logging.info(f"Assigned free port {free_port} for {self._model_name_arg}")
@@ -254,6 +271,7 @@ class VLLMServer:
                     cmd_list.append(f'--{k_dashed}')
                     cmd_list.append(str(v))
 
+
             # --- Construct the executable command string for logging ---
             env_prefix = ""
             if 'CUDA_VISIBLE_DEVICES' in env:
@@ -276,30 +294,98 @@ class VLLMServer:
             else:
                 logging.info("Not using preexec_fn (not Linux or prctl unavailable).")
 
+            # --- Create Log Directory ---
+            # Sanitize model name for directory/file usage
+            sanitized_model_name = self.model_name.replace('/', '_').replace('\\', '_')
+            # Create base log directory if it doesn't exist
+            base_log_dir = os.path.join(os.getcwd(), "vllm_logs")
+            # Create model-specific log directory
+            model_log_dir = os.path.join(base_log_dir, sanitized_model_name)
+            os.makedirs(model_log_dir, exist_ok=True)
+
+            # Get current timestamp for log file name
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            # Log file path will be determined after PID is known
+            log_file_stdout = None
+            log_file_stderr = None
+            stdout_handle = None
+            stderr_handle = None
+
             try:
-                # Use shell=False, pass command as list, use env, and add preexec_fn
-                # Keep start_new_session=True for independent process group if needed,
-                # although PDEATHSIG provides termination guarantee.
+                # --- Start process with Popen ---
+                # Temporarily disable redirection until we have PID if needed, or redirect immediately
+                # For simplicity, let's redirect immediately. Log file name won't include PID yet.
+                # This might be slightly less ideal if multiple processes start concurrently
+                # A better way might involve getting PID first, then managing logs.
+                # Let's try immediate redirection for now.
+
+                # Define log file paths (using model subdir and timestamp)
+                log_file_stdout = os.path.join(model_log_dir, f"{timestamp}.stdout.log")
+                log_file_stderr = os.path.join(model_log_dir, f"{timestamp}.stderr.log")
+
+                logging.info(f"Redirecting VLLM stdout to: {log_file_stdout}")
+                logging.info(f"Redirecting VLLM stderr to: {log_file_stderr}")
+
+                # Open log files for writing
+                stdout_handle = open(log_file_stdout, 'w')
+                stderr_handle = open(log_file_stderr, 'w')
+
                 self.process = subprocess.Popen(
                     cmd_list,
                     env=env,
                     shell=False, # MUST be False for preexec_fn
                     start_new_session=True, # Creates independent process group
-                    preexec_fn=preexec_function # Set parent death signal on Linux
+                    stdout=stdout_handle, # Redirect stdout
+                    stderr=stderr_handle  # Redirect stderr
                 )
                 self.pid = self.process.pid
-                logging.info(f'{self.model_name} process starting with PID: {self.pid}')
+                logging.info(f'{self.model_name} process starting with PID: {self.pid} and logs in {model_log_dir}') # Adjusted log message
+
+                # Optional: Rename log files to include PID now that we have it
+                # This might be less necessary now with timestamp uniqueness, but kept commented if needed
+                # try:
+                #     final_log_stdout = os.path.join(model_log_dir, f"{timestamp}_{self.pid}.stdout.log") # Example with PID
+                #     final_log_stderr = os.path.join(model_log_dir, f"{timestamp}_{self.pid}.stderr.log")
+                #     # Need to close handles before renaming on some OS (e.g., Windows)
+                #     if stdout_handle: stdout_handle.close()
+                #     if stderr_handle: stderr_handle.close()
+                #     os.rename(log_file_stdout, final_log_stdout)
+                #     os.rename(log_file_stderr, final_log_stderr)
+                #     # Reopen handles if needed, or adjust logic downstream
+                #     log_file_stdout = final_log_stdout
+                #     log_file_stderr = final_log_stderr
+                #     logging.info(f"Renamed VLLM log files to include PID: {self.pid}")
+                # except OSError as rename_err:
+                #     logging.warning(f"Could not rename log files to include PID {self.pid}: {rename_err}")
+                #     # Reopen original handles if closed
+                #     stdout_handle = open(log_file_stdout, 'a') # Reopen in append mode maybe?
+                #     stderr_handle = open(log_file_stderr, 'a')
+
             except Exception as e:
                 logging.error(f"Failed to start subprocess for {self.model_name}: {e}", exc_info=True) # Add traceback
+                # --- Close handles if opened ---
+                if stdout_handle:
+                    stdout_handle.close()
+                if stderr_handle:
+                    stderr_handle.close()
+                # --- End close handles ---
                 self.process = None
                 self.pid = None
                 raise RuntimeError(f"Subprocess Popen failed for {self.model_name}") from e
 
             # Wait until the port can respond
-            url = f'http://127.0.0.1:{self.port}/health' # Use /health endpoint if available, fallback to /v1/models
+            url = f'http://localhost:{self.port}/health' # Use /health endpoint if available, fallback to /v1/models
             wait_start_time = time.time()
             max_wait_time = 1200 # 5 minutes max wait time
             connected = False
+
+            proxies = {
+                "http": None,
+                "https": None,
+            }
+
             while time.time() - wait_start_time < max_wait_time:
                 # Check if process terminated unexpectedly
                 if self.process and self.process.poll() is not None:
@@ -308,22 +394,22 @@ class VLLMServer:
                      raise RuntimeError(f"VLLM server process {self.pid} terminated prematurely.")
 
                 try:
-                    r = requests.get(url, timeout=2)
+                    r = requests.get(url, timeout=2, proxies=proxies)
                     # Also check /v1/models as a fallback
                     if r.status_code == 200:
-                         models_url = f'http://127.0.0.1:{self.port}/v1/models'
+                         models_url = f'http://localhost:{self.port}/v1/models'
                          try:
-                             models_r = requests.get(models_url, timeout=2)
+                             models_r = requests.get(models_url, timeout=2, proxies=proxies)
                              if models_r.status_code == 200:
                                  connected = True
                                  break
                          except requests.exceptions.RequestException:
                              pass # /v1/models might not be ready yet even if /health is
                     # If /health failed, try /v1/models directly
-                    elif url == f'http://127.0.0.1:{self.port}/health':
-                         models_url = f'http://127.0.0.1:{self.port}/v1/models'
+                    elif url == f'http://localhost:{self.port}/health':
+                         models_url = f'http://localhost:{self.port}/v1/models'
                          try:
-                             models_r = requests.get(models_url, timeout=2)
+                             models_r = requests.get(models_url, timeout=2, proxies=proxies)
                              if models_r.status_code == 200:
                                  connected = True
                                  break
@@ -467,33 +553,73 @@ class VLLMServer:
             parent = psutil.Process(pid_to_kill)
             # Get children before killing parent
             children = parent.children(recursive=True)
-            # Terminate children first
-            for child in children:
-                try:
-                    child.terminate() # Try graceful termination first
-                except psutil.NoSuchProcess:
-                    pass # Child already gone
-            # Wait a bit for children to terminate
-            gone, alive = psutil.wait_procs(children, timeout=3)
-            for p in alive:
-                try:
-                    p.kill() # Force kill remaining children
-                    # Reduce noise: logging.warning(f"Force killed child process {p.pid} of {pid_to_kill}")
-                except psutil.NoSuchProcess:
-                    pass
 
-            # Terminate the parent process
+            # --- Try SIGINT on parent first --- Allows VLLM potentially cleaner shutdown
+            logging.info(f"Sending SIGINT to parent process {pid_to_kill}...")
             try:
-                parent.terminate() # Try graceful termination
-                parent.wait(timeout=5) # Wait for termination
-                logging.info(f"Parent process {pid_to_kill} terminated gracefully.")
+                # Use os.kill for sending signals directly if psutil doesn't have .interrupt()
+                # Or parent.send_signal(signal.SIGINT) if using newer psutil
+                # Check psutil documentation for the best cross-platform way
+                # For Linux/macOS, os.kill is reliable
+                import os
+                import signal
+                os.kill(pid_to_kill, signal.SIGINT)
+                parent.wait(timeout=5) # Wait up to 5 seconds for graceful exit
+                logging.info(f"Parent process {pid_to_kill} potentially exited after SIGINT.")
             except psutil.TimeoutExpired:
-                logging.warning(f"Parent process {pid_to_kill} did not terminate gracefully. Killing...")
-                parent.kill() # Force kill if necessary
-                parent.wait() # Wait after kill
+                logging.warning(f"Parent process {pid_to_kill} did not exit after SIGINT within timeout.")
+                # Proceed with child termination and more forceful parent termination
             except psutil.NoSuchProcess:
-                 logging.info(f"Parent process {pid_to_kill} already terminated.")
+                logging.info(f"Parent process {pid_to_kill} exited before or during SIGINT wait.")
+                parent = None # Mark parent as gone
+            except Exception as sigint_err:
+                logging.error(f"Error sending SIGINT to parent process {pid_to_kill}: {sigint_err}")
 
+            # --- Terminate Children (if parent still exists or we need to be sure) ---
+            # Re-fetch children if parent might have spawned new ones or some exited
+            if parent and parent.is_running():
+                 children = parent.children(recursive=True)
+            else: # Parent is gone, find children based on original parent PID (less reliable)
+                 # This part is tricky, maybe skip child termination if parent gone?
+                 # For simplicity, let's assume children related to the *original* pid should be cleaned
+                 # Re-finding children orphaned is hard, rely on original list
+                 pass # Keep original children list
+
+            if children:
+                logging.info(f"Terminating child processes of {pid_to_kill}...")
+                # Terminate children first
+                for child in children:
+                    try:
+                        child.terminate() # Try graceful termination first (SIGTERM)
+                    except psutil.NoSuchProcess:
+                        pass # Child already gone
+                # Wait a bit for children to terminate
+                gone, alive = psutil.wait_procs(children, timeout=3)
+                for p in alive:
+                    try:
+                        p.kill() # Force kill remaining children (SIGKILL)
+                        # Reduce noise: logging.warning(f"Force killed child process {p.pid} of {pid_to_kill}")
+                    except psutil.NoSuchProcess:
+                        pass
+                logging.info("Child process termination attempts complete.")
+
+            # --- Terminate Parent (if still running) ---
+            if parent and parent.is_running():
+                 logging.info(f"Parent process {pid_to_kill} still running. Sending SIGTERM...")
+                 try:
+                     parent.terminate() # Try graceful termination (SIGTERM)
+                     parent.wait(timeout=5) # Wait for termination
+                     logging.info(f"Parent process {pid_to_kill} terminated gracefully after SIGTERM.")
+                 except psutil.TimeoutExpired:
+                     logging.warning(f"Parent process {pid_to_kill} did not terminate gracefully after SIGTERM. Sending SIGKILL...")
+                     parent.kill() # Force kill if necessary (SIGKILL)
+                     parent.wait() # Wait after kill
+                     logging.info(f"Parent process {pid_to_kill} killed forcefully.")
+                 except psutil.NoSuchProcess:
+                     logging.info(f"Parent process {pid_to_kill} exited during SIGTERM wait.")
+            elif parent is None:
+                 # Parent already exited (likely after SIGINT or before we checked)
+                 logging.info(f"Parent process {pid_to_kill} was already terminated.")
 
             logging.info(f'Server {model_name_killed} (PID: {pid_to_kill}) termination process complete.')
 
@@ -502,6 +628,57 @@ class VLLMServer:
         except Exception as e:
             logging.error(f"Error during kill_server for {model_name_killed} (PID: {pid_to_kill}): {e}", exc_info=True) # Add traceback
         finally:
+            # --- Add cleanup for potential orphaned multiprocessing processes ---
+            logging.info(f"Scanning for potential orphaned multiprocessing processes related to PID {pid_to_kill}...")
+            cleaned_orphans = False
+            try:
+                # Iterate through all processes
+                for proc in psutil.process_iter(['pid', 'ppid', 'name', 'cmdline']):
+                    try:
+                        cmdline = proc.info.get('cmdline')
+                        if not cmdline: # Skip processes with no command line info
+                            continue
+
+                        # Check if it's a python multiprocessing orphan
+                        is_python = 'python' in proc.info.get('name', '').lower()
+                        is_orphan = proc.info.get('ppid') == 1
+                        is_mp_process = any('multiprocessing.spawn' in arg or 'multiprocessing.resource_tracker' in arg for arg in cmdline)
+
+                        # Heuristic: Check if it looks like a relevant orphan
+                        # This is not perfect and might kill unrelated orphans if run concurrently
+                        # Adding a check related to the model name/path in cmdline might help, but is fragile.
+                        if is_python and is_orphan and is_mp_process:
+                            logging.warning(f"Found potential orphaned multiprocessing process: PID={proc.info['pid']}, Cmd='{' '.join(cmdline)}'. Attempting termination.")
+                            try:
+                                proc.terminate() # Send SIGTERM
+                                try:
+                                    proc.wait(timeout=2)
+                                except psutil.TimeoutExpired:
+                                    logging.warning(f"Orphan process {proc.info['pid']} did not terminate after SIGTERM. Sending SIGKILL...")
+                                    proc.kill() # Send SIGKILL
+                                    proc.wait()
+                                logging.info(f"Terminated potential orphan process {proc.info['pid']}.")
+                                cleaned_orphans = True
+                            except psutil.NoSuchProcess:
+                                logging.info(f"Orphan process {proc.info['pid']} already exited.")
+                            except Exception as orphan_kill_err:
+                                logging.error(f"Error terminating orphan process {proc.info['pid']}: {orphan_kill_err}")
+
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue # Process disappeared or we lack permissions
+                    except Exception as iter_err:
+                         # Log errors during process iteration but continue if possible
+                         logging.error(f"Error processing process PID {proc.info.get('pid', 'N/A')}: {iter_err}")
+
+            except Exception as scan_err:
+                logging.error(f"Error during orphan process scan: {scan_err}", exc_info=True)
+
+            if cleaned_orphans:
+                 logging.info("Orphan process cleanup scan finished. GPU resources might take a moment to be fully released.")
+            else:
+                 logging.info("No suspected orphaned multiprocessing processes found.")
+            # --- End orphan cleanup ---
+
             # Reset state regardless of termination success/failure
             self.process = None
             self.pid = None

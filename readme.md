@@ -45,6 +45,8 @@ python run_api.py
 ```shell
 vi ~/.bashrc
 export MODELSCOPE_CACHE=/Users/xx/tools/cache/modelscope
+
+
 export HF_DATASETS_CACHE=/Users/xx/tools/cache/huggingface
 source ~/.bashrc
 ```

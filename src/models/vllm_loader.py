@@ -6,6 +6,7 @@ import socket
 import time
 import threading
 import datetime # Ensure datetime is imported early for logging setup
+import sys # Add sys import
 # Add imports for prctl
 import ctypes
 import platform # To check OS
@@ -322,9 +323,9 @@ class VLLMServer:
                  cmd_list.extend(['--port', str(self.port)])
 
 
-            logging.info(f"Starting VLLM server for {self.model_name}. Executable command (first few elements): {' '.join(cmd_list[:7])}...")
+            # logging.info(f"Starting VLLM server for {self.model_name}. Executable command (first few elements): {' '.join(cmd_list[:7])}...")
             # Full command can be very long, so log only a part or specific critical params.
-            # logging.info(f"Full VLLM server command: {' '.join(cmd_list)}")
+            logging.info(f"Full VLLM server command: {' '.join(cmd_list)}")
             # logging.info(f"Environment for subprocess will include: CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES')}, VLLM_USE_MODELSCOPE={env.get('VLLM_USE_MODELSCOPE')}")
             logging.info(f"VLLM server environment overrides: VLLM_USE_MODELSCOPE={env.get('VLLM_USE_MODELSCOPE')}, CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', 'Not Set/Let VLLM handle')}")
 

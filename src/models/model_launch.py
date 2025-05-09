@@ -2,7 +2,6 @@ import openai
 from sglang.test.test_utils import is_in_ci
 import sys
 import os
-os.environ["PATH"] = f"/home/renlin/miniconda3/envs/llmder/bin:{os.environ['PATH']}"
 
 if is_in_ci():
     from patch import launch_server_cmd

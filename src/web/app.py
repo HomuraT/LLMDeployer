@@ -8,7 +8,7 @@ from flask import Flask, request, Response, jsonify
 # from pandas.tests.io.formats.test_to_html import justify # Removed unused import
 from rich.console import Console
 
-from src.web.multi_model_utils import get_or_create_model, idle_cleaner
+from src.web.multi_model_utils import get_or_create_model, idle_cleaner, stop_model, list_active_models
 from src.models.vllm_loader import VLLMServer # Import VLLMServer for type hinting and error handling
 
 app = Flask(__name__)
@@ -163,6 +163,74 @@ def embeddings():
         # Catch-all for unexpected errors during model getting/creation or request handling
         logging.exception(f"Unexpected error handling embedding request for model {model_name}: {e}") # Use logging.exception to include traceback
         return jsonify({"error": "An unexpected internal server error occurred during embedding request."}), 500
+
+
+@app.route('/v1/stop_model', methods=['POST'])
+def stop_model_endpoint():
+    """
+    停止并卸载指定的vLLM模型。
+    
+    输入:
+        JSON请求体: {'model': 'model_name'}
+    输出:
+        JSON响应，包含操作结果
+    """
+    try:
+        data = request.json
+        if not data or 'model' not in data:
+            return jsonify({
+                "success": False,
+                "error": "请求JSON中缺少'model'字段"
+            }), 400
+            
+        model_name = data['model']
+        logging.info(f"收到停止模型请求: {model_name}")
+        
+    except Exception as e:
+        logging.error(f"解析停止模型请求JSON时出错: {e}")
+        return jsonify({
+            "success": False,
+            "error": "无效的JSON请求"
+        }), 400
+    
+    try:
+        # 调用停止模型函数
+        result = stop_model(model_name)
+        
+        if result['success']:
+            logging.info(f"成功停止模型: {model_name}")
+            return jsonify(result), 200
+        else:
+            logging.warning(f"停止模型失败: {model_name}, 原因: {result['message']}")
+            return jsonify(result), 400
+            
+    except Exception as e:
+        logging.error(f"停止模型 {model_name} 时发生意外错误: {e}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": f"停止模型时发生内部服务器错误: {str(e)}"
+        }), 500
+
+
+@app.route('/v1/models/active', methods=['GET'])
+def list_active_models_endpoint():
+    """
+    获取当前活跃的模型列表。
+    
+    输入: 无
+    输出:
+        JSON响应，包含活跃模型的列表和相关信息
+    """
+    try:
+        result = list_active_models()
+        return jsonify(result), 200
+        
+    except Exception as e:
+        logging.error(f"获取活跃模型列表时发生错误: {e}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": f"获取模型列表时发生内部服务器错误: {str(e)}"
+        }), 500
 
 
 def run():

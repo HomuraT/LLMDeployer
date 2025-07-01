@@ -306,6 +306,113 @@ def cleanup_vllm_servers():
 
     logging.info("VLLM server global cleanup finished.")
 
+def stop_model(model_name: str) -> dict:
+    """
+    手动停止并移除指定的模型。
+    
+    Args:
+        model_name (str): 要停止的模型名称
+        
+    Returns:
+        dict: 包含操作结果的字典，格式为 {'success': bool, 'message': str}
+    """
+    global model_pool, model_creation_condition
+    
+    with model_creation_condition:
+        # 检查模型是否存在于池中
+        if model_name not in model_pool:
+            return {
+                'success': False, 
+                'message': f'模型 {model_name} 不存在于模型池中'
+            }
+        
+        entry = model_pool[model_name]
+        server_instance = entry.get("server")
+        
+        # 检查模型是否正在创建中
+        if server_instance == "CREATING":
+            return {
+                'success': False,
+                'message': f'模型 {model_name} 正在创建中，无法停止'
+            }
+        
+        # 检查是否为有效的VLLMServer实例
+        if not isinstance(server_instance, VLLMServer):
+            # 移除无效的条目
+            del model_pool[model_name]
+            return {
+                'success': False,
+                'message': f'模型 {model_name} 条目无效，已从池中移除'
+            }
+        
+        # 尝试停止服务器
+        try:
+            logging.info(f"手动停止模型服务器: {model_name}")
+            server_instance.kill_server()
+            
+            # 从模型池中移除
+            del model_pool[model_name]
+            logging.info(f"成功停止并移除模型: {model_name}")
+            
+            return {
+                'success': True,
+                'message': f'成功停止模型 {model_name}'
+            }
+            
+        except Exception as e:
+            logging.error(f"停止模型 {model_name} 时发生错误: {e}", exc_info=True)
+            
+            # 即使停止失败，也尝试从池中移除
+            try:
+                if model_name in model_pool:
+                    del model_pool[model_name]
+            except KeyError:
+                pass
+                
+            return {
+                'success': False,
+                'message': f'停止模型 {model_name} 时发生错误: {str(e)}'
+            }
+
+
+def list_active_models() -> dict:
+    """
+    获取当前活跃的模型列表。
+    
+    Returns:
+        dict: 包含活跃模型信息的字典
+    """
+    global model_pool, model_creation_condition
+    
+    with model_creation_condition:
+        active_models = []
+        
+        for model_name, entry in model_pool.items():
+            server_instance = entry.get("server")
+            last_access = entry.get("last_access")
+            
+            model_info = {
+                'name': model_name,
+                'status': 'CREATING' if server_instance == "CREATING" else 'ACTIVE',
+                'last_access': last_access.isoformat() if isinstance(last_access, datetime) else str(last_access)
+            }
+            
+            # 如果是VLLMServer实例，添加更多信息
+            if isinstance(server_instance, VLLMServer):
+                model_info.update({
+                    'pid': server_instance.pid,
+                    'port': server_instance.port,
+                    'model_name': server_instance.model_name
+                })
+            
+            active_models.append(model_info)
+        
+        return {
+            'success': True,
+            'models': active_models,
+            'total_count': len(active_models)
+        }
+
 # Example usage (commented out - should be started in app.py or similar)
 # cleaner_thread = threading.Thread(target=idle_cleaner, daemon=True)
 # cleaner_thread.start()

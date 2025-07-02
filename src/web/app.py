@@ -8,7 +8,7 @@ from flask import Flask, request, Response, jsonify
 # from pandas.tests.io.formats.test_to_html import justify # Removed unused import
 from rich.console import Console
 
-from src.web.multi_model_utils import get_or_create_model, idle_cleaner, stop_model, list_active_models
+from src.web.multi_model_utils import get_or_create_model, idle_cleaner, stop_model, list_active_models, stop_all_models
 from src.models.vllm_loader import VLLMServer # Import VLLMServer for type hinting and error handling
 
 app = Flask(__name__)
@@ -230,6 +230,46 @@ def list_active_models_endpoint():
         return jsonify({
             "success": False,
             "error": f"获取模型列表时发生内部服务器错误: {str(e)}"
+        }), 500
+
+
+@app.route('/v1/stop_all_models', methods=['POST'])
+def stop_all_models_endpoint():
+    """
+    停止并卸载所有活跃的vLLM模型。
+    
+    输入: 无需输入参数（POST请求）
+    输出:
+        JSON响应，包含操作结果，包括成功停止的模型列表和失败的模型列表
+        {
+            "success": bool,
+            "message": str,
+            "stopped_models": list,
+            "failed_models": list,
+            "total_attempted": int
+        }
+    """
+    try:
+        logging.info("Received request to stop all models")
+        
+        # 调用停止所有模型的函数
+        result = stop_all_models()
+        
+        if result['success']:
+            logging.info(f"Successfully stopped all models: {result['message']}")
+            return jsonify(result), 200
+        else:
+            logging.warning(f"Partially failed to stop all models: {result['message']}")
+            return jsonify(result), 207  # 207 Multi-Status，表示部分成功
+            
+    except Exception as e:
+        logging.error(f"Unexpected error while stopping all models: {e}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": f"Internal server error while stopping all models: {str(e)}",
+            "stopped_models": [],
+            "failed_models": [],
+            "total_attempted": 0
         }), 500
 
 

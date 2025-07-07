@@ -1,4 +1,3 @@
-import logging
 import os
 import sys
 import signal
@@ -18,7 +17,7 @@ try:
         sys.path.append(PARENT_DIR)
 except NameError:
     # __file__ might not be defined in some environments (e.g., interactive)
-    logging.warning("Could not automatically determine project root. Imports might fail if PYTHONPATH is not set.")
+    print("Could not automatically determine project root. Imports might fail if PYTHONPATH is not set.", file=sys.stderr)
 
 
 # Import the necessary utility functions
@@ -28,24 +27,15 @@ try:
         from src.utils.enviroment_utils import set_python_path
         set_python_path() # Ensure PYTHONPATH is set correctly for imports below
     except ImportError:
-        logging.warning("`set_python_path` utility not found or failed. Proceeding without it.")
+        print("`set_python_path` utility not found or failed. Proceeding without it.", file=sys.stderr)
 
     from src.web.multi_model_utils import cleanup_vllm_servers
     from src.utils.process_utils import cleanup_potential_vllm_orphans
+    from src.utils.log_config import logger
 except ImportError as e:
-    logging.error(f"Error importing necessary modules: {e}", exc_info=True)
     print(f"Error importing necessary modules: {e}", file=sys.stderr)
     print("Please ensure the script is run from a location where 'src' package is discoverable, or that PYTHONPATH is configured correctly.", file=sys.stderr)
     sys.exit(1)
-
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)] # Ensure logs go to stdout
-)
-logger = logging.getLogger(__name__) # Use a specific logger
 
 # Define the expected PID file name
 PID_FILENAME = "run_api.pid"

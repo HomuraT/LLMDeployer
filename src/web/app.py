@@ -1,5 +1,4 @@
 import argparse
-import logging
 import threading
 import time # Added for potential sleep/retry logic if needed
 
@@ -10,11 +9,10 @@ from rich.console import Console
 
 from src.web.multi_model_utils import get_or_create_model, idle_cleaner, stop_model, list_active_models, stop_all_models
 from src.models.vllm_loader import VLLMServer # Import VLLMServer for type hinting and error handling
+from src.utils.log_config import logger
 
 app = Flask(__name__)
 console = Console()
-
-logging.basicConfig(level=logging.INFO) # Ensure logging is configured
 
 requests_time_out = 1200
 
@@ -32,14 +30,14 @@ def generate():
         # logging.info('收到消息：'+str(data))
         model_name = data['model']
     except Exception as e:
-        logging.error(f"Error parsing request JSON: {e}")
+        logger.error(f"Error parsing request JSON: {e}")
         return jsonify({"error": "Invalid JSON request"}), 400
 
     try:
         llm: VLLMServer = get_or_create_model(model_name)
         if not llm or not llm.port:
              # This might happen if the initial startup in VLLMServer failed
-             logging.error(f"Failed to get or create a valid server instance for model {model_name}.")
+             logger.error(f"Failed to get or create a valid server instance for model {model_name}.")
              return jsonify({"error": f"Service for model {model_name} is unavailable or failed to start."}), 503
 
         forward_url = f"http://127.0.0.1:{llm.port}/v1/chat/completions"
@@ -56,10 +54,10 @@ def generate():
                             if chunk:
                                 yield chunk
                     except requests.exceptions.ChunkedEncodingError as stream_err:
-                         logging.error(f"Stream interrupted for {model_name}: {stream_err}")
+                         logger.error(f"Stream interrupted for {model_name}: {stream_err}")
                          # Client likely disconnected, nothing specific to yield here
                     except Exception as gen_err:
-                         logging.error(f"Error during stream generation for {model_name}: {gen_err}")
+                         logger.error(f"Error during stream generation for {model_name}: {gen_err}")
                          yield jsonify({"error": "Error during stream generation"}).data # Try to inform client
                     finally:
                          forward_response.close() # Ensure connection is closed
@@ -74,18 +72,18 @@ def generate():
                 return forward_response.content, forward_response.status_code, forward_response.headers.items()
 
         except requests.exceptions.ConnectionError as conn_err:
-            logging.error(f"Connection error to VLLM server {model_name} at {forward_url}: {conn_err}")
+            logger.error(f"Connection error to VLLM server {model_name} at {forward_url}: {conn_err}")
             # Trigger the restart mechanism
             llm.handle_connection_error()
             return jsonify({"error": f"Service for model {model_name} is temporarily unavailable due to connection issue. Restart initiated. Please try again shortly."}), 503
         except requests.exceptions.Timeout as timeout_err:
-             logging.error(f"Timeout connecting to VLLM server {model_name} at {forward_url}: {timeout_err}")
+             logger.error(f"Timeout connecting to VLLM server {model_name} at {forward_url}: {timeout_err}")
              # Decide if timeout should also trigger restart, or just indicate temporary issue
              # llm.handle_connection_error() # Optional: uncomment if timeout implies server death
              return jsonify({"error": f"Request timed out connecting to model {model_name}. The service might be overloaded or unresponsive."}), 504 # Gateway Timeout
         except requests.exceptions.RequestException as req_err:
             # Catch other request errors (like HTTPError from raise_for_status)
-            logging.error(f"Error forwarding request to VLLM server {model_name} at {forward_url}: {req_err}")
+            logger.error(f"Error forwarding request to VLLM server {model_name} at {forward_url}: {req_err}")
             status_code = forward_response.status_code if 'forward_response' in locals() and hasattr(forward_response, 'status_code') else 502 # Bad Gateway
             error_content = forward_response.text if 'forward_response' in locals() and hasattr(forward_response, 'text') else str(req_err)
             # Avoid returning potentially large/sensitive internal error details directly
@@ -93,7 +91,7 @@ def generate():
 
     except Exception as e:
         # Catch-all for unexpected errors during model getting/creation or request handling
-        logging.exception(f"Unexpected error handling request for model {model_name}: {e}") # Use logging.exception to include traceback
+        logger.error(f"Unexpected error handling request for model {model_name}: {e}")
         return jsonify({"error": "An unexpected internal server error occurred."}), 500
 
 
@@ -120,15 +118,15 @@ def embeddings():
         model_name = data['model']
         if 'input' not in data:
              return jsonify({"error": "Missing 'input' in request JSON"}), 400
-        # logging.info(f"Received embedding request for model {model_name}")
+        # logger.info(f"Received embedding request for model {model_name}")
     except Exception as e:
-        logging.error(f"Error parsing embedding request JSON: {e}")
+        logger.error(f"Error parsing embedding request JSON: {e}")
         return jsonify({"error": "Invalid JSON request"}), 400
 
     try:
         llm: VLLMServer = get_or_create_model(model_name)
         if not llm or not llm.port:
-             logging.error(f"Failed to get or create a valid server instance for embedding model {model_name}.")
+             logger.error(f"Failed to get or create a valid server instance for embedding model {model_name}.")
              return jsonify({"error": f"Service for embedding model {model_name} is unavailable or failed to start."}), 503
 
         forward_url = f"http://127.0.0.1:{llm.port}/v1/embeddings"
@@ -143,17 +141,17 @@ def embeddings():
             return forward_response.content, forward_response.status_code, forward_response.headers.items()
 
         except requests.exceptions.ConnectionError as conn_err:
-            logging.error(f"Connection error to VLLM server {model_name} (embeddings) at {forward_url}: {conn_err}")
+            logger.error(f"Connection error to VLLM server {model_name} (embeddings) at {forward_url}: {conn_err}")
             llm.handle_connection_error() # Trigger restart mechanism
             return jsonify({"error": f"Service for embedding model {model_name} is temporarily unavailable due to connection issue. Restart initiated. Please try again shortly."}), 503
         except requests.exceptions.Timeout as timeout_err:
-             logging.error(f"Timeout connecting to VLLM server {model_name} (embeddings) at {forward_url}: {timeout_err}")
+             logger.error(f"Timeout connecting to VLLM server {model_name} (embeddings) at {forward_url}: {timeout_err}")
              # Decide if timeout should also trigger restart, or just indicate temporary issue
              # llm.handle_connection_error() # Optional: uncomment if timeout implies server death
              return jsonify({"error": f"Request timed out connecting to embedding model {model_name}. The service might be overloaded or unresponsive."}), 504 # Gateway Timeout
         except requests.exceptions.RequestException as req_err:
             # Catch other request errors (like HTTPError from raise_for_status)
-            logging.error(f"Error forwarding embedding request to VLLM server {model_name} at {forward_url}: {req_err}")
+            logger.error(f"Error forwarding embedding request to VLLM server {model_name} at {forward_url}: {req_err}")
             status_code = forward_response.status_code if 'forward_response' in locals() and hasattr(forward_response, 'status_code') else 502 # Bad Gateway
             error_content = forward_response.text if 'forward_response' in locals() and hasattr(forward_response, 'text') else str(req_err)
             # Avoid returning potentially large/sensitive internal error details directly
@@ -161,7 +159,7 @@ def embeddings():
 
     except Exception as e:
         # Catch-all for unexpected errors during model getting/creation or request handling
-        logging.exception(f"Unexpected error handling embedding request for model {model_name}: {e}") # Use logging.exception to include traceback
+        logger.error(f"Unexpected error handling embedding request for model {model_name}: {e}")
         return jsonify({"error": "An unexpected internal server error occurred during embedding request."}), 500
 
 
@@ -184,10 +182,10 @@ def stop_model_endpoint():
             }), 400
             
         model_name = data['model']
-        logging.info(f"收到停止模型请求: {model_name}")
+        logger.info(f"收到停止模型请求: {model_name}")
         
     except Exception as e:
-        logging.error(f"解析停止模型请求JSON时出错: {e}")
+        logger.error(f"解析停止模型请求JSON时出错: {e}")
         return jsonify({
             "success": False,
             "error": "无效的JSON请求"
@@ -198,14 +196,14 @@ def stop_model_endpoint():
         result = stop_model(model_name)
         
         if result['success']:
-            logging.info(f"成功停止模型: {model_name}")
+            logger.info(f"成功停止模型: {model_name}")
             return jsonify(result), 200
         else:
-            logging.warning(f"停止模型失败: {model_name}, 原因: {result['message']}")
+            logger.warning(f"停止模型失败: {model_name}, 原因: {result['message']}")
             return jsonify(result), 400
             
     except Exception as e:
-        logging.error(f"停止模型 {model_name} 时发生意外错误: {e}", exc_info=True)
+        logger.error(f"停止模型 {model_name} 时发生意外错误: {e}")
         return jsonify({
             "success": False,
             "error": f"停止模型时发生内部服务器错误: {str(e)}"
@@ -226,7 +224,7 @@ def list_active_models_endpoint():
         return jsonify(result), 200
         
     except Exception as e:
-        logging.error(f"获取活跃模型列表时发生错误: {e}", exc_info=True)
+        logger.error(f"获取活跃模型列表时发生错误: {e}")
         return jsonify({
             "success": False,
             "error": f"获取模型列表时发生内部服务器错误: {str(e)}"
@@ -250,20 +248,20 @@ def stop_all_models_endpoint():
         }
     """
     try:
-        logging.info("Received request to stop all models")
+        logger.info("Received request to stop all models")
         
         # 调用停止所有模型的函数
         result = stop_all_models()
         
         if result['success']:
-            logging.info(f"Successfully stopped all models: {result['message']}")
+            logger.info(f"Successfully stopped all models: {result['message']}")
             return jsonify(result), 200
         else:
-            logging.warning(f"Partially failed to stop all models: {result['message']}")
+            logger.warning(f"Partially failed to stop all models: {result['message']}")
             return jsonify(result), 207  # 207 Multi-Status，表示部分成功
             
     except Exception as e:
-        logging.error(f"Unexpected error while stopping all models: {e}", exc_info=True)
+        logger.error(f"Unexpected error while stopping all models: {e}")
         return jsonify({
             "success": False,
             "error": f"Internal server error while stopping all models: {str(e)}",

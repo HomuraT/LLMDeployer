@@ -8,3 +8,4 @@ requests
 psutil
 nvidia-ml-py
 modelscope
+loguru

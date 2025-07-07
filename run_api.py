@@ -9,12 +9,14 @@ import sys
 # Add imports for signal handling and cleanup
 import signal
 import atexit
-import logging
 
 # Dynamically add the project root to sys.path
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__)) # Assuming run_api.py is in the root
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
+
+# Import the new logging system
+from src.utils.log_config import logger, set_debug_mode
 
 # Import the cleanup function
 from src.web.multi_model_utils import cleanup_vllm_servers
@@ -22,9 +24,6 @@ from src.web.multi_model_utils import cleanup_vllm_servers
 from src.web.app import run as run_flask_app # Import the run function from app.py
 # from src.web.app import app as flask_app # Alternative if run() doesn't exist or you prefer direct control
 from src.utils.process_utils import cleanup_potential_vllm_orphans # Import the new cleanup function
-
-# Configure logging (basic setup)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- PID File Configuration ---
 PID_FILENAME = "run_api.pid"
@@ -35,20 +34,20 @@ def remove_pid_file() -> None:
     try:
         if os.path.exists(PID_FILEPATH):
             os.remove(PID_FILEPATH)
-            logging.info(f"Removed PID file {PID_FILEPATH} on exit.")
+            logger.info(f"Removed PID file {PID_FILEPATH} on exit.")
     except OSError as e:
-        logging.error(f"Error removing PID file {PID_FILEPATH}: {e}", exc_info=True)
+        logger.error(f"Error removing PID file {PID_FILEPATH}: {e}")
 # --- End PID File Configuration ---
 
 
 # --- Signal Handling and Cleanup Registration --- (Modified)
 def handle_signal(signum, frame):
     """Signal handler for SIGINT and SIGTERM."""
-    logging.warning(f"Received signal {signal.Signals(signum).name}. Initiating VLLM server shutdown...")
+    logger.warning(f"Received signal {signal.Signals(signum).name}. Initiating VLLM server shutdown...")
     # It's crucial cleanup happens BEFORE Flask/Werkzeug completely exits if possible
     cleanup_vllm_servers() # Call the cleanup function from multi_model_utils
     remove_pid_file() # Remove PID file before exiting
-    logging.info("Cleanup complete. Exiting run_api process.")
+    logger.info("Cleanup complete. Exiting run_api process.")
     # Allow the signal to potentially propagate or exit cleanly
     # Forceful exit might prevent Flask's own cleanup
     sys.exit(0)
@@ -57,15 +56,15 @@ def handle_signal(signum, frame):
 try:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
-    logging.info("Registered signal handlers for SIGINT and SIGTERM.")
+    logger.info("Registered signal handlers for SIGINT and SIGTERM.")
 except ValueError as e:
     # This can happen if running in a thread where signals can't be registered
-    logging.warning(f"Could not register signal handlers (may be running in a non-main thread): {e}")
+    logger.warning(f"Could not register signal handlers (may be running in a non-main thread): {e}")
 
 # Register the PID file removal function to be called on normal exit or unhandled exceptions
 # atexit cleanup_vllm_servers is removed as it's called within the signal handler now
 atexit.register(remove_pid_file)
-logging.info(f"Registered atexit cleanup function for PID file {PID_FILEPATH}.")
+logger.info(f"Registered atexit cleanup function for PID file {PID_FILEPATH}.")
 # --- End Cleanup Registration ---
 
 # Remove FastAPI specific code
@@ -78,11 +77,11 @@ if __name__ == "__main__":
     try:
         with open(PID_FILEPATH, 'w') as f:
             f.write(str(current_pid))
-        logging.info(f"Main API process started with PID {current_pid}. PID written to {PID_FILEPATH}")
+        logger.info(f"Main API process started with PID {current_pid}. PID written to {PID_FILEPATH}")
         # Note: atexit registration for remove_pid_file is done above, no need to repeat here
     except IOError as e:
-        logging.error(f"Failed to write PID file {PID_FILEPATH}: {e}", exc_info=True)
-        logging.warning("Proceeding without a PID file. Cleanup script might not be able to terminate this process automatically.")
+        logger.error(f"Failed to write PID file {PID_FILEPATH}: {e}")
+        logger.warning("Proceeding without a PID file. Cleanup script might not be able to terminate this process automatically.")
         # Decide if you want to exit if PID file cannot be written
         # sys.exit(1)
     # --- End Write PID file ---
@@ -91,15 +90,15 @@ if __name__ == "__main__":
     try:
         cleanup_potential_vllm_orphans()
     except Exception as initial_cleanup_err:
-        logging.error(f"Error during initial orphan cleanup: {initial_cleanup_err}", exc_info=True)
+        logger.error(f"Error during initial orphan cleanup: {initial_cleanup_err}")
     # --- End initial cleanup ---
 
     # Call the run function from src/web/app.py
-    logging.info(f"Starting Flask server via src.web.app.run()...")
+    logger.info(f"Starting Flask server via src.web.app.run()...")
     try:
         run_flask_app()
     except Exception as flask_err:
-        logging.critical(f"Flask server encountered a fatal error: {flask_err}", exc_info=True)
+        logger.critical(f"Flask server encountered a fatal error: {flask_err}")
         # Ensure cleanup runs even if flask crashes badly, then exit
         # Signal handler might not have been called
         cleanup_vllm_servers()
@@ -108,10 +107,10 @@ if __name__ == "__main__":
     finally:
         # This block might be reached if run_flask_app returns normally
         # or after the try/except block handles an error
-        logging.info("Flask server process is ending.")
+        logger.info("Flask server process is ending.")
         # Ensure cleanup happens on normal return too (atexit should cover this, but belt-and-suspenders)
         # cleanup_vllm_servers() # Potentially redundant if signal/atexit works
         # remove_pid_file() # Already registered with atexit
 
     # Code here might not be reached if Flask runs indefinitely and exits via signal/error
-    logging.info("Flask server has stopped gracefully.") # Might only log if Flask run returns
+    logger.info("Flask server has stopped gracefully.") # Might only log if Flask run returns

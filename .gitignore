@@ -6,6 +6,7 @@ vllm_logs/
 *.log.*.*.*.*
 
 .idea/
+.cursor/
 
 slurm_output/
 

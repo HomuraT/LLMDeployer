@@ -1,8 +1,6 @@
 vllm:
+    model: /seu_share/home/qiguilin/230248999/file/models/models/Qwen/Qwen3-8B
+    served-model-name: Qwen/Qwen3-8B
     tensor_parallel_size: 1
     gpu_memory_utilization: 0.9
     tool-call-parser: hermes
-    dtype: bfloat16
-    max_model_len: 16000
-    model: ~/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
-    served-model-name: Qwen/Qwen3-8B

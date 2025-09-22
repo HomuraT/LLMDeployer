@@ -1,6 +1,6 @@
 vllm:
-  tensor_parallel_size: 1
-  gpu_memory_utilization: 0.8
-  max_model_len: 10000
-  tool-call-parser: hermes
+  model: /seu_share/home/qiguilin/230248999/file/models/models/Qwen/Qwen2.5-7B-Instruct
   served-model-name: Qwen/Qwen2.5-7B-Instruct
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.9
+  tool-call-parser: hermes

@@ -6,6 +6,7 @@ import socket
 import time
 import threading
 import datetime # Ensure datetime is imported early for logging setup
+import sys # Add sys import
 # Add imports for prctl
 import ctypes
 import platform # To check OS
@@ -90,7 +91,7 @@ def load_model(model_name:str, vllm_config=None)->LLM | None:
     """
     Loads a VLLM model based on configuration.
 
-    :param model_name: Name of the model (e.g., 'meta-llama/Llama-3.1-8B-Instruct').
+    :param model_name: Name of the model (e.g., 'meta-llama/Llama-3.1-8B-Instruct' or 'qwen/Qwen-7B' for ModelScope).
     :type model_name: str
     :param vllm_config: Optional VLLM configuration overrides.
     :type vllm_config: dict | None
@@ -101,20 +102,48 @@ def load_model(model_name:str, vllm_config=None)->LLM | None:
         logging.error("Cannot load model, vllm library not imported.")
         return None
 
+    # --- ModelScope Integration ---
+    # Check if we should use ModelScope. This could be driven by a global config or another mechanism.
+    # For now, we assume if a model_name looks like a ModelScope ID (e.g., contains '/'),
+    # or if a specific flag is set in vllm_config, we use ModelScope.
+    # A more robust way would be a dedicated flag or checking model_name format.
+    # Based on user request, we will set it directly.
+    os.environ['VLLM_USE_MODELSCOPE'] = 'True'
+    logging.info("VLLM_USE_MODELSCOPE environment variable set to True for LLM loading.")
+    # The model_name will now be treated as a ModelScope model ID by vLLM.
+    # Ensure 'revision' and 'trust_remote_code' can be passed via vllm_config.
+    # --- End ModelScope Integration ---
+
     if vllm_config is None:
         vllm_config = {}
-    config = YAMLConfigManager.read_yaml(os.path.join(VLLM_MODEL_CONFIG_BASE_PATH, model_name+'.yaml'))
-    if 'huggingface' in config:
+    config_file_path = os.path.join(VLLM_MODEL_CONFIG_BASE_PATH, model_name.replace('/', '_') + '.yaml') # Handle slashes in model_name for filename
+    if not os.path.exists(config_file_path) and '/' in model_name: # Try original name if replacement not found
+        config_file_path = os.path.join(VLLM_MODEL_CONFIG_BASE_PATH, model_name + '.yaml')
+
+    config = YAMLConfigManager.read_yaml(config_file_path) # Adjusted path
+
+    if config and 'huggingface' in config: # Check if config is not None
         huggingface_config = config['huggingface']
         if 'loginToken' in huggingface_config:
             login(huggingface_config['loginToken'])
-    if 'vllm' in config:
-        if vllm_config:
-            vllm_config = config['vllm'].update(vllm_config)
-        else:
-            vllm_config = config['vllm']
+    
+    final_vllm_params = {}
+    if config and 'vllm' in config: # Check if config is not None
+        final_vllm_params.update(config['vllm'])
+    
+    # Overwrite with any explicitly passed vllm_config
+    final_vllm_params.update(vllm_config)
 
-    llm = LLM(model=model_name, **vllm_config)
+    # Ensure 'trust_remote_code' is present if not already, for ModelScope often needed.
+    # This can be controlled via the YAML. Example adds it if not set.
+    # if 'trust_remote_code' not in final_vllm_params:
+    #     final_vllm_params['trust_remote_code'] = True
+    #     logging.info("Setting 'trust_remote_code=True' by default for ModelScope compatibility.")
+
+
+    # The model_name argument to LLM() will be the ModelScope ID.
+    # Other parameters like 'revision', 'trust_remote_code' should be in final_vllm_params.
+    llm = LLM(model=model_name, **final_vllm_params)
     return llm
 
 
@@ -220,10 +249,20 @@ class VLLMServer:
             self.port = vllm_config['port']
 
             # Determine the actual model name to use (from config or constructor arg)
-            self.model_name = vllm_config.get('model', self._model_name_arg) # Prefer config 'model' if present
+            # This model_name will be passed to --model and should be a ModelScope ID
+            self.model_name = vllm_config.get('model', self._model_name_arg) 
 
             # --- Build command for shell=False ---
             env = os.environ.copy() # Start with current environment
+
+            # --- ModelScope Integration for VLLM Server ---
+            env['VLLM_USE_MODELSCOPE'] = 'True'
+            logging.info(f"VLLM_USE_MODELSCOPE environment variable set for VLLM server process for model {self.model_name}.")
+            # Ensure 'trust_remote_code' and 'revision' are handled.
+            # 'trust_remote_code' will be added as a command line arg if present in vllm_config.
+            # 'revision' will also be added as a command line arg if present in vllm_config.
+            # --- End ModelScope Integration ---
+
 
             # --- Determine tensor_parallel_size from config (default 1) ---
             tp_size = vllm_config.get('tensor_parallel_size', 1)
@@ -245,56 +284,53 @@ class VLLMServer:
                 else:
                     # Select the first tp_size GPUs from the pre-selected list
                     gpus_to_use = self._cuda_devices[:tp_size]
-                    env['CUDA_VISIBLE_DEVICES'] = ",".join(map(str, gpus_to_use))
-                    env['CUDA_DEVICE_ORDER'] = "PCI_BUS_ID" # Ensure consistent ordering
-                    logging.info(f"Selected {tp_size} GPU(s) {gpus_to_use} from available list {self._cuda_devices} to match tensor_parallel_size.")
-                    logging.info(f"Setting CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} and CUDA_DEVICE_ORDER=PCI_BUS_ID for {self.model_name}")
-            else:
-                 # No specific GPUs were pre-selected (e.g., cuda=None passed to constructor)
-                 # Let VLLM/CUDA handle GPU selection based on tp_size. Do not set env vars.
-                 logging.info("No specific GPUs pre-selected. VLLM/CUDA will manage GPU allocation based on tensor_parallel_size.")
+                    # Only set CUDA_VISIBLE_DEVICES if _cuda_devices is not empty,
+                    # otherwise let VLLM handle it (e.g. for CPU execution or full auto selection)
+                    if gpus_to_use:
+                        env['CUDA_VISIBLE_DEVICES'] = ",".join(map(str, gpus_to_use))
+                        env['CUDA_DEVICE_ORDER'] = "PCI_BUS_ID" # Ensure consistent ordering
+                        logging.info(f"Selected {tp_size} GPU(s) {gpus_to_use} from available list {self._cuda_devices} to match tensor_parallel_size.")
+                    else:
+                        logging.info("No specific GPUs pre-selected or list was empty. VLLM/CUDA will manage GPU allocation.")
 
-            # Base command - use self.model_name which might come from config
-            # Ensure python executable is correctly found (e.g., use sys.executable)
-            import sys
+            else: # _cuda_devices is None or empty
+                # Let VLLM/CUDA handle GPU selection based on tp_size. Do not set env vars.
+                logging.info("No specific GPUs pre-selected. VLLM/CUDA will manage GPU allocation based on tensor_parallel_size.")
+
             cmd_list = [sys.executable, '-m', 'vllm.entrypoints.openai.api_server', '--model', self.model_name]
 
-            # Add other args from config, skipping 'model' as it's already included
+            # Add other parameters from vllm_config to the command list
+            # This will now also include 'revision' and 'trust_remote_code' if they are in vllm_config
             for k, v in vllm_config.items():
                 if k == 'model': # Already handled
                     continue
-                k_dashed = k.replace('_', '-') # Convert snake_case to kebab-case for CLI args
+                if k == 'port': # Already handled
+                    cmd_list.extend([f'--{k.replace("_", "-")}', str(v)]) # Use the port from vllm_config
+                    continue
+
+                param_name = f'--{k.replace("_", "-")}'
                 if isinstance(v, bool):
-                    if v:
-                        cmd_list.append(f'--{k_dashed}')
-                elif v is not None: # Append key and value if value is not None
-                    cmd_list.append(f'--{k_dashed}')
-                    cmd_list.append(str(v))
+                    if v: # Add flags like --trust-remote-code
+                        cmd_list.append(param_name)
+                elif isinstance(v, list): # Handle list arguments, e.g., --gpu-memory-utilization 0.9 0.8
+                    cmd_list.append(param_name)
+                    cmd_list.extend([str(item) for item in v])
+                else: # Handle key-value arguments
+                    cmd_list.extend([param_name, str(v)])
+            
+            # Ensure port is correctly passed if it was in vllm_config initially or dynamically assigned
+            if '--port' not in cmd_list:
+                 cmd_list.extend(['--port', str(self.port)])
 
 
-            # --- Construct the executable command string for logging ---
-            env_prefix = ""
-            if 'CUDA_VISIBLE_DEVICES' in env:
-                env_prefix = f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} "
-            # Safely quote arguments that might contain spaces or special characters
-            import shlex
-            cmd_str_for_log = env_prefix + " ".join(shlex.quote(arg) for arg in cmd_list)
+            # logging.info(f"Starting VLLM server for {self.model_name}. Executable command (first few elements): {' '.join(cmd_list[:7])}...")
+            # Full command can be very long, so log only a part or specific critical params.
+            logging.info(f"Full VLLM server command: {' '.join(cmd_list)}")
+            # logging.info(f"Environment for subprocess will include: CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES')}, VLLM_USE_MODELSCOPE={env.get('VLLM_USE_MODELSCOPE')}")
+            logging.info(f"VLLM server environment overrides: VLLM_USE_MODELSCOPE={env.get('VLLM_USE_MODELSCOPE')}, CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', 'Not Set/Let VLLM handle')}")
 
-            # --- Log the command ---
-            logging.info(f"Starting VLLM server for {self.model_name}. Executable command:")
-            logging.info(cmd_str_for_log) # Log the executable command separately for clarity
-            # Original logging of just the list and env separately (can be kept or removed)
-            # logging.info(f"Starting VLLM server for {self.model_name} with command list: {cmd_list}")
-            # logging.info(f"Effective environment for subprocess includes: CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', 'Not Set')}")
 
-            # --- Start process with preexec_fn ---
-            preexec_function = set_pdeathsig_kill if IS_LINUX and can_use_prctl else None
-            if preexec_function:
-                logging.info("Using preexec_fn to set PDEATHSIG on Linux.")
-            else:
-                logging.info("Not using preexec_fn (not Linux or prctl unavailable).")
-
-            # --- Create Log Directory ---
+            # Setup log files for the subprocess
             # Sanitize model name for directory/file usage
             sanitized_model_name = self.model_name.replace('/', '_').replace('\\', '_')
             # Create base log directory if it doesn't exist

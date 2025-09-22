@@ -41,6 +41,15 @@ python run_api.py
 ```
 服务启动后，你可以通过指定的 API 端点与部署的 LLM 进行交互。
 
+# 设置魔搭社区缓存地址
+```shell
+vi ~/.bashrc
+export MODELSCOPE_CACHE=/Users/xx/tools/cache/modelscope
+
+
+export HF_DATASETS_CACHE=/Users/xx/tools/cache/huggingface
+source ~/.bashrc
+```
 # 待办事项 (Todo)
 *   [ ] 支持嵌入模型 (Support Embedding Models)
 *   [ ] 支持多模态模型 (Support Multimodal Models)

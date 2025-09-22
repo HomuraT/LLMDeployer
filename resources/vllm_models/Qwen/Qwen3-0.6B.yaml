@@ -1,6 +1,6 @@
 vllm:
-  model: /datanfs2/renlin24/file/modelscope/Qwen2.5-0.5B-Instruct
-  served-model-name: Qwen/Qwen2.5-0.5B-Instruct
+  model: /datanfs2/renlin24/file/modelscope/Qwen/Qwen3-0.6B
+  served-model-name: Qwen/Qwen3-0.6B
   tensor_parallel_size: 1
   gpu_memory_utilization: 0.5
   tool-call-parser: hermes

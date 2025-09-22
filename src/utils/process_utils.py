@@ -1,11 +1,9 @@
 import os
 import subprocess
-import logging
 import psutil
 import signal
 import time
-
-logging.basicConfig(level=logging.INFO)
+from src.utils.log_config import logger
 
 def get_pid_by_grep(pattern: str) -> list[int]:
     """
@@ -25,7 +23,7 @@ def get_pid_by_grep(pattern: str) -> list[int]:
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
         pass
     except Exception as e:
-        logging.error(f"Error finding PID by grep pattern '{pattern}': {e}")
+        logger.error(f"Error finding PID by grep pattern '{pattern}': {e}")
     return pids
 
 def _terminate_process_tree(pid: int, proc: psutil.Process = None):
@@ -44,11 +42,11 @@ def _terminate_process_tree(pid: int, proc: psutil.Process = None):
         try:
             children = proc.children(recursive=True)
         except psutil.Error as e:
-            logging.warning(f"Could not get children for PID {pid}, continuing termination: {e}")
+            logger.warning(f"Could not get children for PID {pid}, continuing termination: {e}")
 
         # Terminate children
         if children:
-            logging.info(f"Terminating child processes of {pid}...")
+            logger.info(f"Terminating child processes of {pid}...")
             for child in children:
                 try:
                     child.terminate()
@@ -62,27 +60,27 @@ def _terminate_process_tree(pid: int, proc: psutil.Process = None):
                     pass
 
         # Terminate parent
-        logging.info(f"Attempting to terminate process {pid}...")
+        logger.info(f"Attempting to terminate process {pid}...")
         try:
             proc.terminate() # SIGTERM
             proc.wait(timeout=3)
-            logging.info(f"Terminated process {pid} with SIGTERM.")
+            logger.info(f"Terminated process {pid} with SIGTERM.")
             return True # Indicate successful termination
         except psutil.TimeoutExpired:
-            logging.warning(f"Process {pid} did not terminate after SIGTERM. Sending SIGKILL...")
+            logger.warning(f"Process {pid} did not terminate after SIGTERM. Sending SIGKILL...")
             proc.kill() # SIGKILL
             proc.wait()
-            logging.info(f"Terminated process {pid} with SIGKILL.")
+            logger.info(f"Terminated process {pid} with SIGKILL.")
             return True # Indicate successful termination (forceful)
         except psutil.NoSuchProcess:
-            logging.info(f"Process {pid} already exited before SIGTERM.")
+            logger.info(f"Process {pid} already exited before SIGTERM.")
             return True # Already gone
 
     except psutil.NoSuchProcess:
-        logging.info(f"Process {pid} not found for termination.")
+        logger.info(f"Process {pid} not found for termination.")
         return True # Consider not found as 'cleaned'
     except Exception as e:
-        logging.error(f"Error during termination of process {pid} tree: {e}")
+        logger.error(f"Error during termination of process {pid} tree: {e}")
         return False # Indicate failure
 
 def cleanup_potential_vllm_orphans():
@@ -90,7 +88,7 @@ def cleanup_potential_vllm_orphans():
     Scans for and attempts to terminate potential orphaned processes 
     related to VLLM, including the main server process and its multiprocessing helpers.
     """
-    logging.info("Scanning for potential orphaned VLLM-related processes at startup...")
+    logger.info("Scanning for potential orphaned VLLM-related processes at startup...")
     cleaned_pids = set()
     processes_to_check = []
 
@@ -103,9 +101,9 @@ def cleanup_potential_vllm_orphans():
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue # Process disappeared or we lack permissions
             except Exception as iter_err:
-                logging.error(f"Error collecting info for process {proc.pid if hasattr(proc, 'pid') else 'N/A'}: {iter_err}")
+                logger.error(f"Error collecting info for process {proc.pid if hasattr(proc, 'pid') else 'N/A'}: {iter_err}")
     except Exception as scan_err:
-        logging.error(f"Error during initial process scan: {scan_err}", exc_info=True)
+        logger.error(f"Error during initial process scan: {scan_err}")
         return # Abort if scan fails
 
     # --- Second pass: Identify and terminate orphans and their children --- 
@@ -126,7 +124,7 @@ def cleanup_potential_vllm_orphans():
 
         # Target 1: Orphaned VLLM main process
         if is_orphan and is_python and is_vllm_main:
-            logging.warning(f"Found potential orphaned VLLM main process: PID={pid}, Cmd='{' '.join(cmdline)}'. Attempting termination of process tree.")
+            logger.warning(f"Found potential orphaned VLLM main process: PID={pid}, Cmd='{' '.join(cmdline)}'. Attempting termination of process tree.")
             if _terminate_process_tree(pid):
                 pids_killed_this_run.add(pid)
                 # Also add potential children PIDs to avoid re-checking them (though _terminate_process_tree handles them)
@@ -140,18 +138,18 @@ def cleanup_potential_vllm_orphans():
                 except psutil.NoSuchProcess:
                     pass # Parent gone, assume children handled or will be found later if orphaned
                 except Exception as e:
-                     logging.warning(f"Could not reliably get/add children of killed orphan {pid}: {e}")
+                     logger.warning(f"Could not reliably get/add children of killed orphan {pid}: {e}")
 
         # Target 2: Orphaned multiprocessing helpers (whose parent might have died *before* this check)
         elif is_orphan and is_python and is_mp_helper:
             # Check if it was already killed as part of a main process tree
             if pid not in pids_killed_this_run:
-                logging.warning(f"Found potential orphaned VLLM multiprocessing helper: PID={pid}, Cmd='{' '.join(cmdline)}'. Attempting termination.")
+                logger.warning(f"Found potential orphaned VLLM multiprocessing helper: PID={pid}, Cmd='{' '.join(cmdline)}'. Attempting termination.")
                 # For helpers, usually no deep process tree, just terminate the process itself
                 if _terminate_process_tree(pid):
                      pids_killed_this_run.add(pid)
 
     if pids_killed_this_run:
-         logging.info(f"Orphan process cleanup scan at startup finished. Terminated PIDs: {pids_killed_this_run}")
+         logger.info(f"Orphan process cleanup scan at startup finished. Terminated PIDs: {pids_killed_this_run}")
     else:
-         logging.info("No suspected orphaned VLLM-related processes found during startup scan.")
+         logger.info("No suspected orphaned VLLM-related processes found during startup scan.")

@@ -1,18 +1,18 @@
 import re
 # Remove subprocess import
 # import subprocess
-import logging # Add logging
+from src.utils.log_config import logger
 try:
     import pynvml
 except ImportError:
     pynvml = None
-    logging.warning("pynvml library not found. GPU availability check will be limited.")
+    logger.warning("pynvml library not found. GPU availability check will be limited.")
 
 try:
     import psutil
 except ImportError:
     psutil = None
-    logging.warning("psutil library not found. Username information for GPU processes will not be available.")
+    logger.warning("psutil library not found. Username information for GPU processes will not be available.")
 
 # Add docstring typing and PyCharm style comments
 def find_available_gpu(model_name: str | None = None, min_memory_mb: int = 24000) -> list[int] | None:
@@ -27,7 +27,7 @@ def find_available_gpu(model_name: str | None = None, min_memory_mb: int = 24000
     :rtype: list[int] | None
     """
     if not pynvml:
-        logging.error("pynvml is not installed. Cannot perform GPU availability check.")
+        logger.error("pynvml is not installed. Cannot perform GPU availability check.")
         return None # Cannot check GPUs without pynvml
 
     if model_name:
@@ -40,7 +40,7 @@ def find_available_gpu(model_name: str | None = None, min_memory_mb: int = 24000
                 min_memory_mb = 10000  # smaller model => smaller memory requirement
             if b_val < 1:
                 min_memory_mb = 3000   # very small model => even smaller
-            logging.info(f"Adjusted minimum memory requirement to {min_memory_mb} MB for model {model_name}")
+            logger.info(f"Adjusted minimum memory requirement to {min_memory_mb} MB for model {model_name}")
 
 
     selected_gpus = []
@@ -49,7 +49,7 @@ def find_available_gpu(model_name: str | None = None, min_memory_mb: int = 24000
     try:
         pynvml.nvmlInit()
         device_count = pynvml.nvmlDeviceGetCount()
-        logging.info(f"Found {device_count} GPUs.")
+        logger.info(f"Found {device_count} GPUs.")
 
         for i in range(device_count):
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
@@ -58,7 +58,7 @@ def find_available_gpu(model_name: str | None = None, min_memory_mb: int = 24000
                 free_memory_mb = mem_info.free // (1024 * 1024) # Convert bytes to MB
                 total_memory_mb = mem_info.total // (1024 * 1024) # Convert bytes to MB
                 used_memory_mb = mem_info.used // (1024 * 1024) # Convert bytes to MB
-                logging.info(f"GPU {i}: Used {used_memory_mb} MB / Total {total_memory_mb} MB (Free: {free_memory_mb} MB)")
+                logger.info(f"GPU {i}: Used {used_memory_mb} MB / Total {total_memory_mb} MB (Free: {free_memory_mb} MB)")
 
                 # Get running compute processes
                 try:
@@ -78,24 +78,24 @@ def find_available_gpu(model_name: str | None = None, min_memory_mb: int = 24000
                                         process = psutil.Process(pid)
                                         username = process.username()
                                     except psutil.NoSuchProcess:
-                                        logging.warning(f"Process with PID {pid} not found by psutil on GPU {i}.")
+                                        logger.warning(f"Process with PID {pid} not found by psutil on GPU {i}.")
                                         username = f"PID {pid} (gone?)" # Mark if process disappeared
                                     except psutil.AccessDenied:
-                                        logging.warning(f"Access denied when trying to get username for PID {pid} on GPU {i}.")
+                                        logger.warning(f"Access denied when trying to get username for PID {pid} on GPU {i}.")
                                         username = f"PID {pid} (no access)"
                                     except Exception as e:
-                                        logging.warning(f"Error getting username for PID {pid} on GPU {i}: {e}")
+                                        logger.warning(f"Error getting username for PID {pid} on GPU {i}: {e}")
                                         username = f"PID {pid} (error)"
 
                                 process_info.append(f"{username} ({used_gpu_memory_mb} MB)")
                             except pynvml.NVMLError as proc_err:
-                                logging.warning(f"Could not get details for a process on GPU {i}: {proc_err}")
+                                logger.warning(f"Could not get details for a process on GPU {i}: {proc_err}")
                         if process_info:
-                             logging.info(f"  Processes on GPU {i}: {'; '.join(process_info)}")
+                             logger.info(f"  Processes on GPU {i}: {'; '.join(process_info)}")
                     else:
-                        logging.info(f"  No running compute processes found on GPU {i}.")
+                        logger.info(f"  No running compute processes found on GPU {i}.")
                 except pynvml.NVMLError as e:
-                    logging.warning(f"Could not get process info for GPU {i}: {e}")
+                    logger.warning(f"Could not get process info for GPU {i}: {e}")
 
                 # Select the GPU(s) with the most memory that satisfy the minimum requirement
                 if free_memory_mb >= min_memory_mb:
@@ -106,18 +106,18 @@ def find_available_gpu(model_name: str | None = None, min_memory_mb: int = 24000
                          selected_gpus.append(i) # Add GPU if it has the same max memory
 
             except pynvml.NVMLError as e:
-                logging.warning(f"Could not get memory info for GPU {i}: {e}")
+                logger.warning(f"Could not get memory info for GPU {i}: {e}")
                 continue # Skip this GPU if info is unavailable
 
         if selected_gpus:
-            logging.info(f"GPU(s) {selected_gpus} selected with >= {min_memory_mb} MB free memory (Max found: {max_memory} MB).")
+            logger.info(f"GPU(s) {selected_gpus} selected with >= {min_memory_mb} MB free memory (Max found: {max_memory} MB).")
             return selected_gpus
         else:
-            logging.info(f"No GPU found with minimum memory of {min_memory_mb} MB free.")
+            logger.info(f"No GPU found with minimum memory of {min_memory_mb} MB free.")
             return None
 
     except pynvml.NVMLError as e:
-        logging.error(f"Failed to initialize NVML or get device count: {e}")
+        logger.error(f"Failed to initialize NVML or get device count: {e}")
         return None
     finally:
         # Ensure NVML is shut down even if errors occur
@@ -125,7 +125,7 @@ def find_available_gpu(model_name: str | None = None, min_memory_mb: int = 24000
             try:
                 pynvml.nvmlShutdown()
             except pynvml.NVMLError as e:
-                logging.error(f"Failed to shutdown NVML: {e}")
+                logger.error(f"Failed to shutdown NVML: {e}")
 
 # Remove the old implementation using subprocess
 # try:

@@ -1,12 +1,11 @@
-import logging
 import os
 import signal
 import subprocess
 import socket
 import time
 import threading
-import datetime # Ensure datetime is imported early for logging setup
-import sys # Add sys import
+import datetime
+import sys
 # Add imports for prctl
 import ctypes
 import platform # To check OS
@@ -20,28 +19,15 @@ try: # Make vllm import optional if needed elsewhere, though likely required her
     from vllm import LLM
 except ImportError:
     LLM = None # type: ignore
-    logging.warning("vLLM library not found. VLLMServer functionality will be limited.")
+    # Import logger after log_config to avoid circular imports
+    from src.utils.log_config import logger
+    logger.warning("vLLM library not found. VLLMServer functionality will be limited.")
 
 from src.utils.config_utils import VLLM_MODEL_CONFIG_BASE_PATH
 from src.utils.process_utils import get_pid_by_grep
 from src.utils.yaml_utils import YAMLConfigManager
-
-# --- Setup file logging ---
-log_dir = os.path.join(os.getcwd(), "logs")
-os.makedirs(log_dir, exist_ok=True)
-log_filename = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".log"
-log_filepath = os.path.join(log_dir, log_filename)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_filepath),
-        logging.StreamHandler() # Keep logging to console as well
-    ]
-)
-logging.info(f"Logging configured. Log file: {log_filepath}")
-# --- End logging setup ---
+# Import the new logging system
+from src.utils.log_config import logger, get_model_logger, cleanup_model_logger
 
 # --- Additions for preexec_fn ---
 IS_LINUX = platform.system() == "Linux"
@@ -57,13 +43,13 @@ if IS_LINUX:
         prctl_syscall.argtypes = [ctypes.c_int, ctypes.c_ulong]
         prctl_syscall.restype = ctypes.c_int
         can_use_prctl = True
-        logging.info("Successfully loaded libc and prctl for PDEATHSIG.")
+        logger.info("Successfully loaded libc and prctl for PDEATHSIG.")
     except OSError as e:
-        logging.warning(f"Could not load libc or find prctl: {e}. PDEATHSIG functionality disabled.")
+        logger.warning(f"Could not load libc or find prctl: {e}. PDEATHSIG functionality disabled.")
         libc = None
         prctl_syscall = None
 else:
-    logging.info("Not running on Linux. PDEATHSIG functionality is not available.")
+    logger.info("Not running on Linux. PDEATHSIG functionality is not available.")
 
 def set_pdeathsig_kill():
     """
@@ -79,11 +65,11 @@ def set_pdeathsig_kill():
             ret = prctl_syscall(PR_SET_PDEATHSIG, signal.SIGKILL)
             if ret != 0:
                 # Try to get errno if possible, might be tricky in preexec_fn
-                logging.warning(f"prctl(PR_SET_PDEATHSIG, SIGKILL) failed in child with return code {ret}")
+                logger.warning(f"prctl(PR_SET_PDEATHSIG, SIGKILL) failed in child with return code {ret}")
         except Exception as e:
             # Logging might be difficult here depending on FD setup,
             # but attempt anyway. A failure here shouldn't prevent startup.
-            logging.warning(f"Exception calling prctl in child: {e}")
+            logger.warning(f"Exception calling prctl in child: {e}")
 # --- End Additions ---
 
 def load_model(model_name:str, vllm_config=None)->LLM | None:
@@ -99,7 +85,7 @@ def load_model(model_name:str, vllm_config=None)->LLM | None:
     :rtype: LLM | None
     """
     if LLM is None:
-        logging.error("Cannot load model, vllm library not imported.")
+        logger.error("Cannot load model, vllm library not imported.")
         return None
 
     # --- ModelScope Integration ---
@@ -109,7 +95,7 @@ def load_model(model_name:str, vllm_config=None)->LLM | None:
     # A more robust way would be a dedicated flag or checking model_name format.
     # Based on user request, we will set it directly.
     os.environ['VLLM_USE_MODELSCOPE'] = 'True'
-    logging.info("VLLM_USE_MODELSCOPE environment variable set to True for LLM loading.")
+    logger.info("VLLM_USE_MODELSCOPE environment variable set to True for LLM loading.")
     # The model_name will now be treated as a ModelScope model ID by vLLM.
     # Ensure 'revision' and 'trust_remote_code' can be passed via vllm_config.
     # --- End ModelScope Integration ---
@@ -176,13 +162,16 @@ class VLLMServer:
         self.port = None # Will be set in _start_server_process
         self.model_name = None # Will be set in _start_server_process
         self.last_config = {} # Store the config used for the last successful start
+        
+        # Create model-specific logger
+        self.logger = get_model_logger(model_name)
 
         # Initial startup attempt
         try:
             self._start_server_process()
         except Exception as e:
             # Log specific error from _start_server_process
-            logging.error(f"Initial startup failed for {self._model_name_arg}: {e}", exc_info=True) # Add traceback
+            self.logger.error(f"Initial startup failed for {self._model_name_arg}: {e}")
             # Ensure consistent state after failure
             self.process = None
             self.pid = None
@@ -202,7 +191,7 @@ class VLLMServer:
             default_config = {'vllm': {'tensor_parallel_size': 1}} # Simplified default
             YAMLConfigManager.write_yaml(yaml_path, default_config)
             config = default_config
-            logging.info(f"Created default config file at {yaml_path}")
+            self.logger.info(f"Created default config file at {yaml_path}")
         else:
             config = YAMLConfigManager.read_yaml(yaml_path)
 
@@ -227,7 +216,7 @@ class VLLMServer:
         """
         with self._restart_lock: # Ensure only one thread starts/restarts at a time
             if self._is_restarting:
-                 logging.info(f"Server {self._model_name_arg} is already restarting. Skipping.")
+                 self.logger.info(f"Server {self._model_name_arg} is already restarting. Skipping.")
                  return # Avoid race condition if called concurrently
 
             # Load config each time to pick up potential manual changes
@@ -241,9 +230,9 @@ class VLLMServer:
                         s.bind(('localhost', 0))
                         free_port = s.getsockname()[1]
                     vllm_config['port'] = free_port
-                    logging.info(f"Assigned free port {free_port} for {self._model_name_arg}")
+                    self.logger.info(f"Assigned free port {free_port} for {self._model_name_arg}")
                 except socket.error as e:
-                    logging.error(f"Failed to find a free port: {e}")
+                    self.logger.error(f"Failed to find a free port: {e}")
                     raise RuntimeError("Could not bind to a free port") from e
             
             self.port = vllm_config['port']
@@ -257,7 +246,7 @@ class VLLMServer:
 
             # --- ModelScope Integration for VLLM Server ---
             env['VLLM_USE_MODELSCOPE'] = 'True'
-            logging.info(f"VLLM_USE_MODELSCOPE environment variable set for VLLM server process for model {self.model_name}.")
+            self.logger.info(f"VLLM_USE_MODELSCOPE environment variable set for VLLM server process for model {self.model_name}.")
             # Ensure 'trust_remote_code' and 'revision' are handled.
             # 'trust_remote_code' will be added as a command line arg if present in vllm_config.
             # 'revision' will also be added as a command line arg if present in vllm_config.
@@ -267,9 +256,9 @@ class VLLMServer:
             # --- Determine tensor_parallel_size from config (default 1) ---
             tp_size = vllm_config.get('tensor_parallel_size', 1)
             if 'tensor_parallel_size' not in vllm_config:
-                 logging.info("tensor_parallel_size not found in config, defaulting to 1.")
+                 self.logger.info("tensor_parallel_size not found in config, defaulting to 1.")
             else:
-                 logging.info(f"Using configured tensor_parallel_size={tp_size} from config.")
+                 self.logger.info(f"Using configured tensor_parallel_size={tp_size} from config.")
 
             # --- Select GPUs and set environment variables ---
             if self._cuda_devices: # Check if specific GPUs were pre-selected based on availability
@@ -279,7 +268,7 @@ class VLLMServer:
                     error_msg = (f"Configuration requires tensor_parallel_size={tp_size}, "
                                  f"but only {num_available_selected} suitable GPUs ({self._cuda_devices}) were found/selected. "
                                  f"Cannot start VLLM server for {self.model_name}.")
-                    logging.error(error_msg)
+                    self.logger.error(error_msg)
                     raise RuntimeError(error_msg)
                 else:
                     # Select the first tp_size GPUs from the pre-selected list
@@ -289,13 +278,13 @@ class VLLMServer:
                     if gpus_to_use:
                         env['CUDA_VISIBLE_DEVICES'] = ",".join(map(str, gpus_to_use))
                         env['CUDA_DEVICE_ORDER'] = "PCI_BUS_ID" # Ensure consistent ordering
-                        logging.info(f"Selected {tp_size} GPU(s) {gpus_to_use} from available list {self._cuda_devices} to match tensor_parallel_size.")
+                        self.logger.info(f"Selected {tp_size} GPU(s) {gpus_to_use} from available list {self._cuda_devices} to match tensor_parallel_size.")
                     else:
-                        logging.info("No specific GPUs pre-selected or list was empty. VLLM/CUDA will manage GPU allocation.")
+                        self.logger.info("No specific GPUs pre-selected or list was empty. VLLM/CUDA will manage GPU allocation.")
 
             else: # _cuda_devices is None or empty
                 # Let VLLM/CUDA handle GPU selection based on tp_size. Do not set env vars.
-                logging.info("No specific GPUs pre-selected. VLLM/CUDA will manage GPU allocation based on tensor_parallel_size.")
+                self.logger.info("No specific GPUs pre-selected. VLLM/CUDA will manage GPU allocation based on tensor_parallel_size.")
 
             cmd_list = [sys.executable, '-m', 'vllm.entrypoints.openai.api_server', '--model', self.model_name]
 
@@ -323,11 +312,11 @@ class VLLMServer:
                  cmd_list.extend(['--port', str(self.port)])
 
 
-            # logging.info(f"Starting VLLM server for {self.model_name}. Executable command (first few elements): {' '.join(cmd_list[:7])}...")
+            # self.logger.info(f"Starting VLLM server for {self.model_name}. Executable command (first few elements): {' '.join(cmd_list[:7])}...")
             # Full command can be very long, so log only a part or specific critical params.
-            logging.info(f"Full VLLM server command: {' '.join(cmd_list)}")
-            # logging.info(f"Environment for subprocess will include: CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES')}, VLLM_USE_MODELSCOPE={env.get('VLLM_USE_MODELSCOPE')}")
-            logging.info(f"VLLM server environment overrides: VLLM_USE_MODELSCOPE={env.get('VLLM_USE_MODELSCOPE')}, CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', 'Not Set/Let VLLM handle')}")
+            self.logger.info(f"Full VLLM server command: {' '.join(cmd_list)}")
+            # self.logger.info(f"Environment for subprocess will include: CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES')}, VLLM_USE_MODELSCOPE={env.get('VLLM_USE_MODELSCOPE')}")
+            self.logger.info(f"VLLM server environment overrides: VLLM_USE_MODELSCOPE={env.get('VLLM_USE_MODELSCOPE')}, CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', 'Not Set/Let VLLM handle')}")
 
 
             # Setup log files for the subprocess
@@ -344,10 +333,8 @@ class VLLMServer:
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
             # Log file path will be determined after PID is known
-            log_file_stdout = None
-            log_file_stderr = None
-            stdout_handle = None
-            stderr_handle = None
+            log_file = None
+            log_handle = None
 
             try:
                 # --- Start process with Popen ---
@@ -357,56 +344,46 @@ class VLLMServer:
                 # A better way might involve getting PID first, then managing logs.
                 # Let's try immediate redirection for now.
 
-                # Define log file paths (using model subdir and timestamp)
-                log_file_stdout = os.path.join(model_log_dir, f"{timestamp}.stdout.log")
-                log_file_stderr = os.path.join(model_log_dir, f"{timestamp}.stderr.log")
+                # Define log file path (single file for both stdout and stderr)
+                log_file = os.path.join(model_log_dir, f"{timestamp}.log")
 
-                logging.info(f"Redirecting VLLM stdout to: {log_file_stdout}")
-                logging.info(f"Redirecting VLLM stderr to: {log_file_stderr}")
+                self.logger.info(f"Redirecting VLLM output to: {log_file}")
 
-                # Open log files for writing
-                stdout_handle = open(log_file_stdout, 'w')
-                stderr_handle = open(log_file_stderr, 'w')
+                # Open log file for writing
+                log_handle = open(log_file, 'w')
 
                 self.process = subprocess.Popen(
                     cmd_list,
                     env=env,
                     shell=False, # MUST be False for preexec_fn
                     start_new_session=True, # Creates independent process group
-                    stdout=stdout_handle, # Redirect stdout
-                    stderr=stderr_handle  # Redirect stderr
+                    stdout=log_handle, # Redirect stdout
+                    stderr=log_handle  # Redirect stderr to same file
                 )
                 self.pid = self.process.pid
-                logging.info(f'{self.model_name} process starting with PID: {self.pid} and logs in {model_log_dir}') # Adjusted log message
+                self.logger.info(f'{self.model_name} process starting with PID: {self.pid} and logs in {model_log_dir}') # Adjusted log message
 
-                # Optional: Rename log files to include PID now that we have it
+                # Optional: Rename log file to include PID now that we have it
                 # This might be less necessary now with timestamp uniqueness, but kept commented if needed
                 # try:
-                #     final_log_stdout = os.path.join(model_log_dir, f"{timestamp}_{self.pid}.stdout.log") # Example with PID
-                #     final_log_stderr = os.path.join(model_log_dir, f"{timestamp}_{self.pid}.stderr.log")
-                #     # Need to close handles before renaming on some OS (e.g., Windows)
-                #     if stdout_handle: stdout_handle.close()
-                #     if stderr_handle: stderr_handle.close()
-                #     os.rename(log_file_stdout, final_log_stdout)
-                #     os.rename(log_file_stderr, final_log_stderr)
-                #     # Reopen handles if needed, or adjust logic downstream
-                #     log_file_stdout = final_log_stdout
-                #     log_file_stderr = final_log_stderr
-                #     logging.info(f"Renamed VLLM log files to include PID: {self.pid}")
+                #     final_log = os.path.join(model_log_dir, f"{timestamp}_{self.pid}.log") # Example with PID
+                #     # Need to close handle before renaming on some OS (e.g., Windows)
+                #     if log_handle: log_handle.close()
+                #     os.rename(log_file, final_log)
+                #     # Reopen handle if needed, or adjust logic downstream
+                #     log_file = final_log
+                #     self.logger.info(f"Renamed VLLM log file to include PID: {self.pid}")
                 # except OSError as rename_err:
-                #     logging.warning(f"Could not rename log files to include PID {self.pid}: {rename_err}")
-                #     # Reopen original handles if closed
-                #     stdout_handle = open(log_file_stdout, 'a') # Reopen in append mode maybe?
-                #     stderr_handle = open(log_file_stderr, 'a')
+                #     self.logger.warning(f"Could not rename log file to include PID {self.pid}: {rename_err}")
+                #     # Reopen original handle if closed
+                #     log_handle = open(log_file, 'a') # Reopen in append mode maybe?
 
             except Exception as e:
-                logging.error(f"Failed to start subprocess for {self.model_name}: {e}", exc_info=True) # Add traceback
-                # --- Close handles if opened ---
-                if stdout_handle:
-                    stdout_handle.close()
-                if stderr_handle:
-                    stderr_handle.close()
-                # --- End close handles ---
+                self.logger.error(f"Failed to start subprocess for {self.model_name}: {e}")
+                # --- Close handle if opened ---
+                if log_handle:
+                    log_handle.close()
+                # --- End close handle ---
                 self.process = None
                 self.pid = None
                 raise RuntimeError(f"Subprocess Popen failed for {self.model_name}") from e
@@ -425,7 +402,7 @@ class VLLMServer:
             while time.time() - wait_start_time < max_wait_time:
                 # Check if process terminated unexpectedly
                 if self.process and self.process.poll() is not None:
-                     logging.error(f"VLLM server process {self.pid} terminated unexpectedly during startup.")
+                     self.logger.error(f"VLLM server process {self.pid} terminated unexpectedly during startup.")
                      self.kill_server() # Ensure cleanup
                      raise RuntimeError(f"VLLM server process {self.pid} terminated prematurely.")
 
@@ -455,19 +432,19 @@ class VLLMServer:
                 except requests.exceptions.ConnectionError:
                     # Check if process died while trying to connect
                     if self.process and self.process.poll() is not None:
-                        logging.error(f"VLLM server process {self.pid} terminated unexpectedly while waiting for connection. Exit code: {self.process.returncode}")
+                        self.logger.error(f"VLLM server process {self.pid} terminated unexpectedly while waiting for connection. Exit code: {self.process.returncode}")
                         self.kill_server() # Ensure cleanup
                         raise RuntimeError(f"VLLM server process {self.pid} terminated prematurely during startup.")
                     pass # Server not up yet, and process is still running (or None)
                 except requests.exceptions.Timeout:
-                    logging.warning(f"Connection timeout while waiting for {self.model_name} at {url}. Retrying...")
+                    self.logger.warning(f"Connection timeout while waiting for {self.model_name} at {url}. Retrying...")
                 except requests.exceptions.RequestException as e:
-                    logging.warning(f"Request exception while waiting for {self.model_name}: {e}. Retrying...")
+                    self.logger.warning(f"Request exception while waiting for {self.model_name}: {e}. Retrying...")
 
                 time.sleep(2) # Wait longer between checks
 
             if not connected:
-                logging.error(f"Failed to connect to VLLM server {self.model_name} at port {self.port} after {max_wait_time} seconds.")
+                self.logger.error(f"Failed to connect to VLLM server {self.model_name} at port {self.port} after {max_wait_time} seconds.")
                 self.kill_server() # Ensure cleanup
                 raise RuntimeError(f"VLLM server failed to start or become responsive on port {self.port}")
 
@@ -476,7 +453,7 @@ class VLLMServer:
                 base_url=f'http://localhost:{self.port}/v1',
                 api_key='null', # vLLM OpenAI endpoint doesn't require a key
             )
-            logging.info(f'{self.model_name} started successfully on port {self.port} with PID {self.pid}')
+            self.logger.info(f'{self.model_name} started successfully on port {self.port} with PID {self.pid}')
             self._restart_attempts = 0 # Reset restart counter on successful start
 
 
@@ -505,7 +482,7 @@ class VLLMServer:
             resp = self.client.chat.completions.create(**payload)
             return resp
         except Exception as e:
-            logging.error(f"Error during chat completion request to {self.model_name}: {e}")
+            self.logger.error(f"Error during chat completion request to {self.model_name}: {e}")
             # Consider if specific exceptions should trigger a restart check here too,
             # although the primary trigger is ConnectionError in the web app.
             raise # Re-raise the exception
@@ -518,11 +495,11 @@ class VLLMServer:
         """
         with self._restart_lock: # Acquire lock before checking/modifying state
             if self._is_restarting:
-                logging.info(f"Restart already in progress for {self._model_name_arg}, ignoring concurrent error.")
+                self.logger.info(f"Restart already in progress for {self._model_name_arg}, ignoring concurrent error.")
                 return # Another thread is handling the restart
 
             if self._restart_attempts >= self.MAX_RESTARTS:
-                logging.error(f"Maximum restart attempts ({self.MAX_RESTARTS}) reached for {self._model_name_arg}. Server marked as failed.")
+                self.logger.error(f"Maximum restart attempts ({self.MAX_RESTARTS}) reached for {self._model_name_arg}. Server marked as failed.")
                 # Optionally, mark this server instance as permanently failed in the pool
                 self.kill_server() # Ensure it's dead
                 # How to signal permanent failure? Maybe set pid/port to None and don't retry?
@@ -532,16 +509,16 @@ class VLLMServer:
 
             self._is_restarting = True # Mark that we are attempting a restart
             self._restart_attempts += 1
-            logging.warning(f"Connection error detected for {self._model_name_arg}. Attempting restart ({self._restart_attempts}/{self.MAX_RESTARTS})...")
+            self.logger.warning(f"Connection error detected for {self._model_name_arg}. Attempting restart ({self._restart_attempts}/{self.MAX_RESTARTS})...")
 
             # --- Perform Restart ---
             # 1. Ensure the old process is terminated
-            logging.info(f"Killing existing server process for {self._model_name_arg} before restart...")
+            self.logger.info(f"Killing existing server process for {self._model_name_arg} before restart...")
             self.kill_server() # Use the existing kill method
             time.sleep(2) # Give OS time to release resources (like port)
 
             # 2. Attempt to start a new server process using the last known good config
-            logging.info(f"Attempting to restart {self._model_name_arg} using last known config...")
+            self.logger.info(f"Attempting to restart {self._model_name_arg} using last known config...")
             try:
                 # Reset relevant state variables before starting
                 self.process = None
@@ -551,12 +528,12 @@ class VLLMServer:
                 self.client = None
                 # We call _start_server_process which uses self.last_config internally now
                 self._start_server_process() # This resets self._restart_attempts on success
-                logging.info(f"Restart successful for {self._model_name_arg}.")
+                self.logger.info(f"Restart successful for {self._model_name_arg}.")
                 # _start_server_process resets attempts, so no need here if successful
 
             except Exception as e:
                 # Use exc_info=True for traceback
-                logging.error(f"Restart attempt {self._restart_attempts} failed for {self._model_name_arg}: {e}", exc_info=True)
+                self.logger.error(f"Restart attempt {self._restart_attempts} failed for {self._model_name_arg}: {e}")
                 # If startup fails again, kill_server was likely called within _start_server_process
                 # or should be called to ensure cleanup
                 self.kill_server() # Make sure it's cleaned up after failed restart attempt
@@ -576,7 +553,7 @@ class VLLMServer:
         model_name_killed = self.model_name or self._model_name_arg # Use loaded name if available
 
         if pid_to_kill is None:
-            logging.info(f"No active process PID found for {model_name_killed} to kill.")
+            self.logger.info(f"No active process PID found for {model_name_killed} to kill.")
             # Reset state even if no PID was found, in case process object exists
             self.process = None
             self.client = None
@@ -584,14 +561,14 @@ class VLLMServer:
             # Keep self.last_config
             return
 
-        logging.info(f"Attempting to terminate server {model_name_killed} (PID: {pid_to_kill})...")
+        self.logger.info(f"Attempting to terminate server {model_name_killed} (PID: {pid_to_kill})...")
         try:
             parent = psutil.Process(pid_to_kill)
             # Get children before killing parent
             children = parent.children(recursive=True)
 
             # --- Try SIGINT on parent first --- Allows VLLM potentially cleaner shutdown
-            logging.info(f"Sending SIGINT to parent process {pid_to_kill}...")
+            self.logger.info(f"Sending SIGINT to parent process {pid_to_kill}...")
             try:
                 # Use os.kill for sending signals directly if psutil doesn't have .interrupt()
                 # Or parent.send_signal(signal.SIGINT) if using newer psutil
@@ -601,15 +578,15 @@ class VLLMServer:
                 import signal
                 os.kill(pid_to_kill, signal.SIGINT)
                 parent.wait(timeout=5) # Wait up to 5 seconds for graceful exit
-                logging.info(f"Parent process {pid_to_kill} potentially exited after SIGINT.")
+                self.logger.info(f"Parent process {pid_to_kill} potentially exited after SIGINT.")
             except psutil.TimeoutExpired:
-                logging.warning(f"Parent process {pid_to_kill} did not exit after SIGINT within timeout.")
+                self.logger.warning(f"Parent process {pid_to_kill} did not exit after SIGINT within timeout.")
                 # Proceed with child termination and more forceful parent termination
             except psutil.NoSuchProcess:
-                logging.info(f"Parent process {pid_to_kill} exited before or during SIGINT wait.")
+                self.logger.info(f"Parent process {pid_to_kill} exited before or during SIGINT wait.")
                 parent = None # Mark parent as gone
             except Exception as sigint_err:
-                logging.error(f"Error sending SIGINT to parent process {pid_to_kill}: {sigint_err}")
+                self.logger.error(f"Error sending SIGINT to parent process {pid_to_kill}: {sigint_err}")
 
             # --- Terminate Children (if parent still exists or we need to be sure) ---
             # Re-fetch children if parent might have spawned new ones or some exited
@@ -622,7 +599,7 @@ class VLLMServer:
                  pass # Keep original children list
 
             if children:
-                logging.info(f"Terminating child processes of {pid_to_kill}...")
+                self.logger.info(f"Terminating child processes of {pid_to_kill}...")
                 # Terminate children first
                 for child in children:
                     try:
@@ -634,38 +611,38 @@ class VLLMServer:
                 for p in alive:
                     try:
                         p.kill() # Force kill remaining children (SIGKILL)
-                        # Reduce noise: logging.warning(f"Force killed child process {p.pid} of {pid_to_kill}")
+                        # Reduce noise: self.logger.warning(f"Force killed child process {p.pid} of {pid_to_kill}")
                     except psutil.NoSuchProcess:
                         pass
-                logging.info("Child process termination attempts complete.")
+                self.logger.info("Child process termination attempts complete.")
 
             # --- Terminate Parent (if still running) ---
             if parent and parent.is_running():
-                 logging.info(f"Parent process {pid_to_kill} still running. Sending SIGTERM...")
+                 self.logger.info(f"Parent process {pid_to_kill} still running. Sending SIGTERM...")
                  try:
                      parent.terminate() # Try graceful termination (SIGTERM)
                      parent.wait(timeout=5) # Wait for termination
-                     logging.info(f"Parent process {pid_to_kill} terminated gracefully after SIGTERM.")
+                     self.logger.info(f"Parent process {pid_to_kill} terminated gracefully after SIGTERM.")
                  except psutil.TimeoutExpired:
-                     logging.warning(f"Parent process {pid_to_kill} did not terminate gracefully after SIGTERM. Sending SIGKILL...")
+                     self.logger.warning(f"Parent process {pid_to_kill} did not terminate gracefully after SIGTERM. Sending SIGKILL...")
                      parent.kill() # Force kill if necessary (SIGKILL)
                      parent.wait() # Wait after kill
-                     logging.info(f"Parent process {pid_to_kill} killed forcefully.")
+                     self.logger.info(f"Parent process {pid_to_kill} killed forcefully.")
                  except psutil.NoSuchProcess:
-                     logging.info(f"Parent process {pid_to_kill} exited during SIGTERM wait.")
+                     self.logger.info(f"Parent process {pid_to_kill} exited during SIGTERM wait.")
             elif parent is None:
                  # Parent already exited (likely after SIGINT or before we checked)
-                 logging.info(f"Parent process {pid_to_kill} was already terminated.")
+                 self.logger.info(f"Parent process {pid_to_kill} was already terminated.")
 
-            logging.info(f'Server {model_name_killed} (PID: {pid_to_kill}) termination process complete.')
+            self.logger.info(f'Server {model_name_killed} (PID: {pid_to_kill}) termination process complete.')
 
         except psutil.NoSuchProcess:
-            logging.warning(f'Process with PID {pid_to_kill} not found during termination attempt for {model_name_killed}. It might have already exited.')
+            self.logger.warning(f'Process with PID {pid_to_kill} not found during termination attempt for {model_name_killed}. It might have already exited.')
         except Exception as e:
-            logging.error(f"Error during kill_server for {model_name_killed} (PID: {pid_to_kill}): {e}", exc_info=True) # Add traceback
+            self.logger.error(f"Error during kill_server for {model_name_killed} (PID: {pid_to_kill}): {e}")
         finally:
             # --- Add cleanup for potential orphaned multiprocessing processes ---
-            logging.info(f"Scanning for potential orphaned multiprocessing processes related to PID {pid_to_kill}...")
+            self.logger.info(f"Scanning for potential orphaned multiprocessing processes related to PID {pid_to_kill}...")
             cleaned_orphans = False
             try:
                 # Iterate through all processes
@@ -684,35 +661,35 @@ class VLLMServer:
                         # This is not perfect and might kill unrelated orphans if run concurrently
                         # Adding a check related to the model name/path in cmdline might help, but is fragile.
                         if is_python and is_orphan and is_mp_process:
-                            logging.warning(f"Found potential orphaned multiprocessing process: PID={proc.info['pid']}, Cmd='{' '.join(cmdline)}'. Attempting termination.")
+                            self.logger.warning(f"Found potential orphaned multiprocessing process: PID={proc.info['pid']}, Cmd='{' '.join(cmdline)}'. Attempting termination.")
                             try:
                                 proc.terminate() # Send SIGTERM
                                 try:
                                     proc.wait(timeout=2)
                                 except psutil.TimeoutExpired:
-                                    logging.warning(f"Orphan process {proc.info['pid']} did not terminate after SIGTERM. Sending SIGKILL...")
+                                    self.logger.warning(f"Orphan process {proc.info['pid']} did not terminate after SIGTERM. Sending SIGKILL...")
                                     proc.kill() # Send SIGKILL
                                     proc.wait()
-                                logging.info(f"Terminated potential orphan process {proc.info['pid']}.")
+                                self.logger.info(f"Terminated potential orphan process {proc.info['pid']}.")
                                 cleaned_orphans = True
                             except psutil.NoSuchProcess:
-                                logging.info(f"Orphan process {proc.info['pid']} already exited.")
+                                self.logger.info(f"Orphan process {proc.info['pid']} already exited.")
                             except Exception as orphan_kill_err:
-                                logging.error(f"Error terminating orphan process {proc.info['pid']}: {orphan_kill_err}")
+                                self.logger.error(f"Error terminating orphan process {proc.info['pid']}: {orphan_kill_err}")
 
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         continue # Process disappeared or we lack permissions
                     except Exception as iter_err:
                          # Log errors during process iteration but continue if possible
-                         logging.error(f"Error processing process PID {proc.info.get('pid', 'N/A')}: {iter_err}")
+                         self.logger.error(f"Error processing process PID {proc.info.get('pid', 'N/A')}: {iter_err}")
 
             except Exception as scan_err:
-                logging.error(f"Error during orphan process scan: {scan_err}", exc_info=True)
+                self.logger.error(f"Error during orphan process scan: {scan_err}")
 
             if cleaned_orphans:
-                 logging.info("Orphan process cleanup scan finished. GPU resources might take a moment to be fully released.")
+                 self.logger.info("Orphan process cleanup scan finished. GPU resources might take a moment to be fully released.")
             else:
-                 logging.info("No suspected orphaned multiprocessing processes found.")
+                 self.logger.info("No suspected orphaned multiprocessing processes found.")
             # --- End orphan cleanup ---
 
             # Reset state regardless of termination success/failure
@@ -721,4 +698,7 @@ class VLLMServer:
             self.client = None
             self.port = None # Port might be reusable now
             # Keep self.last_config
-            logging.info(f"State reset for {model_name_killed} instance.")
+            self.logger.info(f"State reset for {model_name_killed} instance.")
+            
+            # Clean up the model logger when server is killed
+            cleanup_model_logger(self._model_name_arg)

@@ -1,0 +1,23 @@
+[project]
+name = "llmdeployer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "flask>=3.1.1",
+    "loguru>=0.7.3",
+    "modelscope>=1.27.1",
+    "ninja>=1.11.1.4",
+    "nvidia-ml-py>=12.575.51",
+    "psutil>=7.0.0",
+    "pytest>=8.4.1",
+    "requests>=2.32.4",
+    "rich>=14.0.0",
+    "uv>=0.7.19",
+    "vllm>=0.9.1",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true

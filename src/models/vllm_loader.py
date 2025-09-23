@@ -15,13 +15,7 @@ import requests
 from huggingface_hub import login
 from openai import OpenAI
 from tqdm import tqdm
-try: # Make vllm import optional if needed elsewhere, though likely required here
-    from vllm import LLM
-except ImportError:
-    LLM = None # type: ignore
-    # Import logger after log_config to avoid circular imports
-    from src.utils.log_config import logger
-    logger.warning("vLLM library not found. VLLMServer functionality will be limited.")
+from vllm import LLM
 
 from src.utils.config_utils import VLLM_MODEL_CONFIG_BASE_PATH
 from src.utils.process_utils import get_pid_by_grep

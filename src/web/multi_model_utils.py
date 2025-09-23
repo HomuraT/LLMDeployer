@@ -1,21 +1,103 @@
 import threading
 import time
+import os
 from datetime import datetime, timedelta
+ 
 from typing import Dict, Any, Optional
 
 from src.models.vllm_loader import VLLMServer
 from src.utils.gpu_utils import find_available_gpu
 from src.utils.log_config import logger
+from src.utils.yaml_utils import YAMLConfigManager
+from src.utils.config_utils import VLLM_MODEL_CONFIG_BASE_PATH
 
 # Assume these imports exist in your environment
 # from src.models.vllm_loader import VLLMServer
 # from src.models.gpu_utils import find_available_gpu
 
 model_pool: Dict[str, Dict[str, Any]] = {}
-# 全局锁，用于保护整个get_or_create_model方法
+# 全局锁：仅用于短时访问/修改 model_pool 的元数据，避免长时间阻塞
 model_global_lock = threading.Lock()
 IDLE_TIMEOUT = timedelta(minutes=10) # Example: 10 minutes idle timeout
 MODEL_TTL_MINUTES = 60 # Time-to-live for inactive models
+
+# 正在启动阶段已预留的 GPU 集合（避免并发选择相同 GPU 导致卡住）
+reserved_gpus: set[int] = set()
+
+
+def _read_tp_size_from_yaml(model_name: str) -> int:
+    """
+    从模型 YAML 读取 vllm.tensor_parallel_size，默认 1。
+    兼容两种路径形式：带目录分隔的原始 `model_name` 与用下划线替换后的文件名。
+    """
+    try:
+        # 形式一：目录结构
+        yaml_path1 = os.path.join(VLLM_MODEL_CONFIG_BASE_PATH, model_name + '.yaml')
+        # 形式二：下划线扁平化
+        yaml_path2 = os.path.join(VLLM_MODEL_CONFIG_BASE_PATH, model_name.replace('/', '_') + '.yaml')
+        yaml_path = yaml_path1 if os.path.exists(yaml_path1) else yaml_path2
+        cfg = YAMLConfigManager.read_yaml(yaml_path) if os.path.exists(yaml_path) else None
+        if cfg and isinstance(cfg, dict):
+            v = cfg.get('vllm') or {}
+            tp = v.get('tensor_parallel_size', 1)
+            try:
+                return int(tp)
+            except Exception:
+                return 1
+        return 1
+    except Exception:
+        return 1
+
+
+def _reserve_gpus_for_start(model_name: str, tp_size: int, wait_timeout_sec: int = 180) -> Optional[list[int]]:
+    """
+    并发安全地为模型启动预留 tp_size 个 GPU；在超时时间内不断尝试。
+    成功返回预留的 GPU 列表；失败返回 None。
+    """
+    deadline = time.time() + max(1, wait_timeout_sec)
+    reserved_for_this: list[int] = []
+    while time.time() < deadline and len(reserved_for_this) < tp_size:
+        # 构造排除集合：已被其他启动任务预留的 GPU
+        with model_global_lock:
+            exclude = sorted(list(reserved_gpus))
+        # 选择一个候选 GPU（find_available_gpu 返回按最大空闲的一组，取首个）
+        candidates = find_available_gpu(model_name=model_name, exclude_gpus=exclude)
+        if not candidates:
+            time.sleep(1.0)
+            continue
+        chosen = candidates[0]
+        # 尝试占用 chosen（双重检查）
+        with model_global_lock:
+            if chosen in reserved_gpus:
+                # 已被他人抢占，重试
+                pass
+            else:
+                reserved_gpus.add(chosen)
+                reserved_for_this.append(chosen)
+                logger.info(f"为模型 {model_name} 预留 GPU {chosen}（{len(reserved_for_this)}/{tp_size}）")
+        if len(reserved_for_this) < tp_size:
+            # 稍作等待再抢占下一个，避免忙等
+            time.sleep(0.2)
+
+    if len(reserved_for_this) == tp_size:
+        return reserved_for_this
+
+    # 失败则释放本次已预留
+    if reserved_for_this:
+        with model_global_lock:
+            for g in reserved_for_this:
+                reserved_gpus.discard(g)
+        logger.warning(f"为模型 {model_name} 预留 GPU 超时/失败，已释放部分预留: {reserved_for_this}")
+    return None
+
+
+def _release_reserved_gpus(gpus: Optional[list[int]]):
+    if not gpus:
+        return
+    with model_global_lock:
+        for g in gpus:
+            reserved_gpus.discard(g)
+    logger.info(f"释放启动期预留的 GPU: {gpus}")
 
 def get_or_create_model(model_name: str) -> VLLMServer | None:
     """
@@ -30,75 +112,156 @@ def get_or_create_model(model_name: str) -> VLLMServer | None:
     """
     global model_pool, model_global_lock
 
-    # 整个方法使用全局锁保护
+    # 先在锁内进行快速路径与占位，再在锁外执行耗时创建
+    create_event: Optional[threading.Event] = None
+    am_creator = False
+    server_to_kill: Optional[VLLMServer] = None
     with model_global_lock:
-        logger.info(f"获取模型锁成功，开始处理模型: {model_name}")
-        
-        # 检查模型是否已存在
+        # 已存在条目：需要判断健康状态
         if model_name in model_pool:
             entry = model_pool[model_name]
             server_instance = entry.get("server")
-            
-            # 验证是否为有效的VLLMServer实例
-            if isinstance(server_instance, VLLMServer):
-                entry["last_access"] = datetime.now()  # 更新访问时间
+            # 情况A：正在创建中 -> 等待
+            if entry.get("creating") and isinstance(entry.get("event"), threading.Event):
+                create_event = None
+            # 情况B：有实例则直接复用（懒健康策略），失败由调用方处理
+            elif isinstance(server_instance, VLLMServer):
+                entry["last_access"] = datetime.now()
                 logger.info(f"返回现有的服务器实例: {model_name}")
                 return server_instance
             else:
-                # 清理无效条目
-                logger.warning(f"发现无效的模型条目: {model_name}，类型: {type(server_instance)}，正在清理")
-                del model_pool[model_name]
-
-        # 模型不存在，开始创建新实例
-        logger.info(f"模型 {model_name} 不存在于池中，开始创建新实例")
-        
-        server_instance: VLLMServer | None = None
-        try:
-            # 查找可用GPU
-            available_gpus = find_available_gpu(model_name=model_name)
-            if not available_gpus:
-                logger.error(f"未找到适合模型 {model_name} 的GPU，无法创建服务器")
-                return None
-            
-            logger.info(f"为模型 {model_name} 在GPU {available_gpus} 上创建VLLMServer")
-            
-            # 创建VLLMServer实例（这是阻塞操作）
-            server_instance = VLLMServer(model_name, cuda=available_gpus)
-            
-            # 验证服务器初始化是否成功
-            if (server_instance and 
-                server_instance.pid and 
-                server_instance.port and 
-                server_instance.client):
-                
-                # 成功创建，添加到模型池
+                # 条目无效：转入创建路径
+                logger.warning(f"模型 {model_name} 的池条目无效，重新创建")
+                create_event = threading.Event()
                 model_pool[model_name] = {
-                    "server": server_instance, 
+                    "creating": True,
+                    "event": create_event,
                     "last_access": datetime.now()
                 }
-                logger.info(f"VLLMServer创建成功: {model_name} "
-                           f"(PID: {server_instance.pid}, Port: {server_instance.port})")
-                return server_instance
-            else:
-                logger.error(f"VLLMServer初始化失败: {model_name} "
-                            f"(PID/Port/Client检查失败)")
-                # 清理失败的实例
-                if server_instance and hasattr(server_instance, 'kill_server'):
-                    try:
-                        server_instance.kill_server()
-                    except Exception as kill_e:
-                        logger.error(f"清理失败服务器实例时出错: {model_name}: {kill_e}")
+                am_creator = True
+        else:
+            # 不存在：放置占位，开始创建
+            logger.info(f"模型 {model_name} 不存在于池中，放置占位并开始创建新实例")
+            create_event = threading.Event()
+            model_pool[model_name] = {
+                "creating": True,
+                "event": create_event,
+                "last_access": datetime.now()
+            }
+            am_creator = True
+
+    if not am_creator:
+        # 说明存在占位但不是我们创建，等待他人创建结果
+        wait_event: Optional[threading.Event] = None
+        with model_global_lock:
+            entry = model_pool.get(model_name)
+            if entry and entry.get("creating") and isinstance(entry.get("event"), threading.Event):
+                wait_event = entry["event"]
+        if wait_event:
+            # 最多等待5分钟，避免永久卡死
+            wait_event.wait(timeout=300)
+        # 创建完成后读取结果
+        with model_global_lock:
+            entry = model_pool.get(model_name)
+            if not entry:
+                logger.error(f"模型 {model_name} 创建占位结束但条目缺失")
                 return None
-                
+            server_instance = entry.get("server")
+            if isinstance(server_instance, VLLMServer):
+                entry["last_access"] = datetime.now()
+                return server_instance
+            logger.error(f"模型 {model_name} 创建失败或无效条目: {entry}")
+            # 清理无效占位
+            try:
+                del model_pool[model_name]
+            except KeyError:
+                pass
+            return None
+
+    # 锁外：如果需要，先关闭失效的旧实例，避免GPU/端口占用导致重复启动
+    if server_to_kill is not None:
+        try:
+            logger.info(f"Attempting to kill stale server before recreate: {model_name}")
+            server_to_kill.kill_server()
         except Exception as e:
-            logger.error(f"创建VLLMServer时发生异常: {model_name}: {e}")
-            # 尝试清理部分创建的实例
+            logger.error(f"Error killing stale server for {model_name}: {e}")
+
+    # 我们负责创建的路径：锁外执行耗时操作
+    server_instance: VLLMServer | None = None
+    try:
+        # 读取 tp_size，并按数量进行并发安全的 GPU 预留
+        tp_size = _read_tp_size_from_yaml(model_name)
+        if tp_size < 1:
+            tp_size = 1
+        pre_reserved = _reserve_gpus_for_start(model_name, tp_size)
+        if not pre_reserved:
+            logger.error(f"未找到适合模型 {model_name} 的GPU，无法创建服务器")
+            # 标记失败并清理占位
+            with model_global_lock:
+                model_pool[model_name] = {
+                    "status": "FAILED",
+                    "error": "NO_SUITABLE_GPU",
+                    "last_access": datetime.now()
+                }
+            return None
+        # 在占用列表基础上创建 VLLMServer（其内部会再根据 tp_size 进行校验及 env 设置）
+        logger.info(f"为模型 {model_name} 在GPU {pre_reserved} 上创建VLLMServer（按 tp_size={tp_size} 预留）")
+        server_instance = VLLMServer(model_name, cuda=pre_reserved)
+        if (server_instance and server_instance.pid and server_instance.port and server_instance.client):
+            with model_global_lock:
+                model_pool[model_name] = {
+                    "server": server_instance,
+                    "last_access": datetime.now(),
+                    "last_healthy": datetime.now(),
+                    "unhealthy_count": 0
+                }
+                # 通知等待者
+                create_event.set()
+            # 启动成功后释放预留（此时进程已占用显存，不再需要“软预留”）
+            _release_reserved_gpus(pre_reserved)
+            logger.info(f"VLLMServer创建成功: {model_name} (PID: {server_instance.pid}, Port: {server_instance.port})")
+            return server_instance
+        else:
+            logger.error(f"VLLMServer初始化失败: {model_name} (PID/Port/Client检查失败)")
             if server_instance and hasattr(server_instance, 'kill_server'):
                 try:
                     server_instance.kill_server()
                 except Exception as kill_e:
-                    logger.error(f"异常处理时清理服务器失败: {model_name}: {kill_e}")
+                    logger.error(f"清理失败服务器实例时出错: {model_name}: {kill_e}")
+            with model_global_lock:
+                model_pool[model_name] = {
+                    "status": "FAILED",
+                    "error": "INIT_VALIDATION_FAILED",
+                    "last_access": datetime.now()
+                }
+            _release_reserved_gpus(pre_reserved)
             return None
+    except Exception as e:
+        logger.error(f"创建VLLMServer时发生异常: {model_name}: {e}")
+        if server_instance and hasattr(server_instance, 'kill_server'):
+            try:
+                server_instance.kill_server()
+            except Exception as kill_e:
+                logger.error(f"异常处理时清理服务器失败: {model_name}: {kill_e}")
+        # 标记失败
+        with model_global_lock:
+            model_pool[model_name] = {
+                "status": "FAILED",
+                "error": str(e),
+                "last_access": datetime.now()
+            }
+        # 异常同样释放预留
+        try:
+            _release_reserved_gpus(pre_reserved)
+        except Exception:
+            pass
+        return None
+    finally:
+        # 无论成功失败，都应通知等待者结束等待
+        try:
+            create_event.set()
+        except Exception:
+            pass
 
 def idle_cleaner():
     """
@@ -107,58 +270,36 @@ def idle_cleaner():
     Handles potential race conditions during iteration and removal.
     """
     while True:
-        time.sleep(60) # Check every 60 seconds
-        with model_global_lock: # Acquire lock for safe access and modification
+        time.sleep(60)
+        to_kill: list[tuple[str, VLLMServer]] = []
+        with model_global_lock:
             now = datetime.now()
-            to_remove = [] # List of model names to remove
-
-            # Iterate over a snapshot of model names to avoid issues with dict size changes during iteration
             current_model_names = list(model_pool.keys())
-
             for m_name in current_model_names:
-                info = model_pool.get(m_name) # Get current info under lock
-
-                # --- Basic validation of the entry ---
-                if not isinstance(info, dict) or "server" not in info or "last_access" not in info:
-                    logger.warning(f"Found malformed entry for '{m_name}' in model_pool during cleanup: {info}. Skipping.")
-                    continue # Skip potentially corrupted entries
-
+                info = model_pool.get(m_name)
+                if not isinstance(info, dict):
+                    continue
+                # 跳过正在创建的条目
+                if info.get("creating"):
+                    continue
                 server_instance = info.get("server")
                 last_access_time = info.get("last_access")
-
-                # --- Check: Idle timeout for valid server instances ---
                 if isinstance(server_instance, VLLMServer) and isinstance(last_access_time, datetime):
                     if (now - last_access_time) > IDLE_TIMEOUT:
-                        logger.info(f"Model {m_name} idle timeout ({IDLE_TIMEOUT}) reached (Last access: {last_access_time}). Scheduling for removal.")
-                        to_remove.append(m_name)
-
-            # --- Perform removals after iteration ---
-            for m_name in to_remove:
-                info_to_remove = model_pool.get(m_name) # Re-get info under lock before acting
-
-                if not info_to_remove:
-                     logger.warning(f"Tried to remove '{m_name}', but it was already gone from the pool.")
-                     continue
-
-                server_instance_to_kill = info_to_remove.get("server")
-
-                # Kill the server only if it's a valid VLLMServer instance
-                if isinstance(server_instance_to_kill, VLLMServer):
-                    logger.info(f"Attempting to kill idle/stuck server for model {m_name}.")
-                    try:
-                        server_instance_to_kill.kill_server()
-                        logger.info(f"Successfully killed server for model {m_name}.")
-                    except Exception as e:
-                        logger.error(f"Error killing server for idle/stuck model {m_name}: {e}")
-                        # Continue to remove from pool even if killing fails
-
-                # Always remove the entry from the pool after processing
-                try:
-                    if m_name in model_pool: # Check again before deleting
-                        del model_pool[m_name]
-                        logger.info(f"Removed entry for model {m_name} from pool.")
-                except KeyError:
-                     logger.warning(f"Tried to delete entry for '{m_name}', but it was already gone (potential race condition?).")
+                        # 从池中移除，并记录待杀
+                        to_kill.append((m_name, server_instance))
+                        try:
+                            del model_pool[m_name]
+                        except KeyError:
+                            pass
+        # 锁外执行 kill，避免长时间阻塞
+        for m_name, server in to_kill:
+            logger.info(f"Attempting to kill idle/stuck server for model {m_name}.")
+            try:
+                server.kill_server()
+                logger.info(f"Successfully killed server for model {m_name}.")
+            except Exception as e:
+                logger.error(f"Error killing server for idle/stuck model {m_name}: {e}")
 
 def cleanup_inactive_models():
     """
@@ -221,40 +362,42 @@ def cleanup_vllm_servers():
     global model_pool, model_global_lock
     logger.info("Initiating VLLM server cleanup on application shutdown...")
 
-    # Use the global lock to safely access and modify the pool
+    to_kill: list[tuple[str, VLLMServer]] = []
     with model_global_lock:
-        # Iterate over a copy of keys to avoid modification issues during iteration
         model_names = list(model_pool.keys())
         logger.info(f"Found models in pool to cleanup: {model_names}")
-
         for model_name in model_names:
-            # Check existence again within the loop as map might change (though less likely with lock)
-            if model_name in model_pool:
-                entry = model_pool.get(model_name)
-                # Check if the entry exists and contains a valid server instance
-                if entry and isinstance(entry, dict) and "server" in entry:
-                    server_instance = entry["server"]
-                    # Check if it's an actual VLLMServer instance
-                    if isinstance(server_instance, VLLMServer):
-                        logger.info(f"Shutting down VLLM server for model: {model_name}")
-                        try:
-                            # kill_server() should handle its own logging for PID etc.
-                            server_instance.kill_server()
-                        except Exception as e:
-                            logger.error(f"Error shutting down server for {model_name}: {e}")
-                    else:
-                        logger.warning(f"Found unexpected server entry in model_pool for {model_name} during cleanup: {server_instance}")
-
-                    # Remove from pool after attempting cleanup
-                    # It's important to clear the pool so subsequent checks know it's gone
+            entry = model_pool.get(model_name)
+            if not entry or not isinstance(entry, dict):
+                # 清理异常条目
+                try:
+                    if model_name in model_pool:
+                        del model_pool[model_name]
+                except KeyError:
+                    pass
+                continue
+            # 跳过正在创建的条目，但也从池中移除，避免泄漏
+            if entry.get("creating"):
+                try:
                     del model_pool[model_name]
-
-                elif entry:
-                    logger.warning(f"Found unexpected entry structure in model_pool for {model_name} during cleanup: {entry}")
-                    # Also remove inconsistent entries
-                    del model_pool[model_name]
-            else:
-                 logger.warning(f"Model {model_name} disappeared from pool during cleanup iteration.")
+                except KeyError:
+                    pass
+                continue
+            server_instance = entry.get("server")
+            if isinstance(server_instance, VLLMServer):
+                to_kill.append((model_name, server_instance))
+            # 无论是否有效，都从池中移除
+            try:
+                del model_pool[model_name]
+            except KeyError:
+                pass
+    # 锁外执行 kill
+    for model_name, server_instance in to_kill:
+        logger.info(f"Shutting down VLLM server for model: {model_name}")
+        try:
+            server_instance.kill_server()
+        except Exception as e:
+            logger.error(f"Error shutting down server for {model_name}: {e}")
 
     logger.info("VLLM server global cleanup finished.")
 
@@ -270,54 +413,49 @@ def stop_model(model_name: str) -> dict:
     """
     global model_pool, model_global_lock
     
+    server_to_kill: Optional[VLLMServer] = None
     with model_global_lock:
-        # 检查模型是否存在于池中
         if model_name not in model_pool:
-            return {
-                'success': False, 
-                'message': f'模型 {model_name} 不存在于模型池中'
-            }
-        
-        entry = model_pool[model_name]
-        server_instance = entry.get("server")
-        
-        # 检查是否为有效的VLLMServer实例
-        if not isinstance(server_instance, VLLMServer):
-            # 移除无效的条目
-            del model_pool[model_name]
-            return {
-                'success': False,
-                'message': f'模型 {model_name} 条目无效，已从池中移除'
-            }
-        
-        # 尝试停止服务器
-        try:
-            logger.info(f"手动停止模型服务器: {model_name}")
-            server_instance.kill_server()
-            
-            # 从模型池中移除
-            del model_pool[model_name]
-            logger.info(f"成功停止并移除模型: {model_name}")
-            
-            return {
-                'success': True,
-                'message': f'成功停止模型 {model_name}'
-            }
-            
-        except Exception as e:
-            logger.error(f"停止模型 {model_name} 时发生错误: {e}")
-            
-            # 即使停止失败，也尝试从池中移除
+            return {'success': False, 'message': f'模型 {model_name} 不存在于模型池中'}
+        entry = model_pool.get(model_name)
+        if not isinstance(entry, dict):
             try:
-                if model_name in model_pool:
-                    del model_pool[model_name]
+                del model_pool[model_name]
             except KeyError:
                 pass
-                
-            return {
-                'success': False,
-                'message': f'停止模型 {model_name} 时发生错误: {str(e)}'
-            }
+            return {'success': False, 'message': f'模型 {model_name} 条目无效，已从池中移除'}
+        # 正在创建的直接移除
+        if entry.get("creating"):
+            try:
+                del model_pool[model_name]
+            except KeyError:
+                pass
+            return {'success': True, 'message': f'成功停止模型 {model_name} (创建中占位已移除)'}
+        server_instance = entry.get("server")
+        if isinstance(server_instance, VLLMServer):
+            server_to_kill = server_instance
+            try:
+                del model_pool[model_name]
+            except KeyError:
+                pass
+        else:
+            try:
+                del model_pool[model_name]
+            except KeyError:
+                pass
+            return {'success': False, 'message': f'模型 {model_name} 条目无效，已从池中移除'}
+
+    # 锁外执行 kill
+    if server_to_kill:
+        try:
+            logger.info(f"手动停止模型服务器: {model_name}")
+            server_to_kill.kill_server()
+            logger.info(f"成功停止并移除模型: {model_name}")
+            return {'success': True, 'message': f'成功停止模型 {model_name}'}
+        except Exception as e:
+            logger.error(f"停止模型 {model_name} 时发生错误: {e}")
+            return {'success': False, 'message': f'停止模型 {model_name} 时发生错误: {str(e)}'}
+    return {'success': False, 'message': f'模型 {model_name} 未找到可停止的实例'}
 
 
 def list_active_models() -> dict:
@@ -331,27 +469,39 @@ def list_active_models() -> dict:
     
     with model_global_lock:
         active_models = []
-        
         for model_name, entry in model_pool.items():
-            server_instance = entry.get("server")
+            if not isinstance(entry, dict):
+                active_models.append({'name': model_name, 'status': 'INVALID'})
+                continue
             last_access = entry.get("last_access")
-            
+            if entry.get("creating"):
+                active_models.append({
+                    'name': model_name,
+                    'status': 'STARTING',
+                    'last_access': last_access.isoformat() if isinstance(last_access, datetime) else str(last_access)
+                })
+                continue
+            if entry.get("status") == "FAILED":
+                active_models.append({
+                    'name': model_name,
+                    'status': 'FAILED',
+                    'error': entry.get('error'),
+                    'last_access': last_access.isoformat() if isinstance(last_access, datetime) else str(last_access)
+                })
+                continue
+            server_instance = entry.get("server")
             model_info = {
                 'name': model_name,
-                'status': 'ACTIVE' if isinstance(server_instance, VLLMServer) else 'INVALID',
+                'status': 'STARTED' if isinstance(server_instance, VLLMServer) else 'INVALID',
                 'last_access': last_access.isoformat() if isinstance(last_access, datetime) else str(last_access)
             }
-            
-            # 如果是VLLMServer实例，添加更多信息
             if isinstance(server_instance, VLLMServer):
                 model_info.update({
                     'pid': server_instance.pid,
                     'port': server_instance.port,
                     'model_name': server_instance.model_name
                 })
-            
             active_models.append(model_info)
-        
         return {
             'success': True,
             'models': active_models,
@@ -368,85 +518,59 @@ def stop_all_models() -> dict:
     """
     global model_pool, model_global_lock
     
+    stopped_models: list[str] = []
+    failed_models: list[dict] = []
+    to_kill: list[tuple[str, VLLMServer]] = []
     with model_global_lock:
-        # 如果模型池为空
         if not model_pool:
-            return {
-                'success': True,
-                'message': 'Model pool is empty, no models to stop',
-                'stopped_models': [],
-                'failed_models': []
-            }
-        
-        stopped_models = []
-        failed_models = []
-        
-        # 获取当前所有模型的名称列表
+            return {'success': True, 'message': 'Model pool is empty, no models to stop', 'stopped_models': [], 'failed_models': []}
         model_names = list(model_pool.keys())
         logger.info(f"开始停止所有模型，共 {len(model_names)} 个模型: {model_names}")
-        
         for model_name in model_names:
-            # 再次检查模型是否仍在池中（防止并发修改）
-            if model_name not in model_pool:
-                logger.warning(f"模型 {model_name} 在停止过程中从池中消失")
-                continue
-            
-            entry = model_pool[model_name]
-            server_instance = entry.get("server")
-            
-            # 检查是否为有效的VLLMServer实例
-            if not isinstance(server_instance, VLLMServer):
-                # 移除无效的条目
+            entry = model_pool.get(model_name)
+            if not entry or not isinstance(entry, dict):
                 try:
                     del model_pool[model_name]
-                    failed_models.append({
-                        'name': model_name,
-                        'reason': 'Invalid entry, removed from pool'
-                    })
                 except KeyError:
                     pass
+                failed_models.append({'name': model_name, 'reason': 'Invalid entry, removed from pool'})
                 continue
-            
-            # 尝试停止服务器
-            try:
-                logger.info(f"停止模型服务器: {model_name}")
-                server_instance.kill_server()
-                
-                # 从模型池中移除
-                del model_pool[model_name]
-                stopped_models.append(model_name)
-                logger.info(f"成功停止模型: {model_name}")
-                
-            except Exception as e:
-                logger.error(f"停止模型 {model_name} 时发生错误: {e}")
-                
-                # 即使停止失败，也尝试从池中移除
+            if entry.get("creating"):
                 try:
-                    if model_name in model_pool:
-                        del model_pool[model_name]
+                    del model_pool[model_name]
                 except KeyError:
                     pass
-                    
-                failed_models.append({
-                    'name': model_name,
-                    'reason': str(e)
-                })
-        
-        # 生成结果报告
-        total_attempted = len(stopped_models) + len(failed_models)
-        success = len(failed_models) == 0
-        
-        if success:
-            message = f"Successfully stopped all {len(stopped_models)} models"
-        else:
-            message = f"Stopped {len(stopped_models)} models, {len(failed_models)} models failed to stop"
-        
-        logger.info(f"停止所有模型操作完成: {message}")
-        
-        return {
-            'success': success,
-            'message': message,
-            'stopped_models': stopped_models,
-            'failed_models': failed_models,
-            'total_attempted': total_attempted
-        }
+                stopped_models.append(model_name)
+                continue
+            server_instance = entry.get("server")
+            if isinstance(server_instance, VLLMServer):
+                to_kill.append((model_name, server_instance))
+                try:
+                    del model_pool[model_name]
+                except KeyError:
+                    pass
+            else:
+                try:
+                    del model_pool[model_name]
+                except KeyError:
+                    pass
+                failed_models.append({'name': model_name, 'reason': 'Invalid entry, removed from pool'})
+    # 锁外执行 kill
+    for model_name, server_instance in to_kill:
+        try:
+            logger.info(f"停止模型服务器: {model_name}")
+            server_instance.kill_server()
+            stopped_models.append(model_name)
+            logger.info(f"成功停止模型: {model_name}")
+        except Exception as e:
+            logger.error(f"停止模型 {model_name} 时发生错误: {e}")
+            failed_models.append({'name': model_name, 'reason': str(e)})
+
+    total_attempted = len(stopped_models) + len(failed_models)
+    success = len(failed_models) == 0
+    if success:
+        message = f"Successfully stopped all {len(stopped_models)} models"
+    else:
+        message = f"Stopped {len(stopped_models)} models, {len(failed_models)} models failed to stop"
+    logger.info(f"停止所有模型操作完成: {message}")
+    return {'success': success, 'message': message, 'stopped_models': stopped_models, 'failed_models': failed_models, 'total_attempted': total_attempted}

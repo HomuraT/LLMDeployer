@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LLMDeployer 管理后台</title>
+  <link rel="stylesheet" href="/static/admin.css" />
+</head>
+<body>
+  <header>
+    <h1>LLMDeployer 管理后台</h1>
+    <div id="sys"></div>
+  </header>
+
+  <main>
+    <div class="toolbar">
+      <div class="tabs">
+        <div class="tab active" data-tab="tab-overview">概览</div>
+        <div class="tab" data-tab="tab-models">快速启动</div>
+        <div class="tab" data-tab="tab-tools">工具</div>
+      </div>
+      <button id="refreshBtn">刷新</button>
+    </div>
+    <section class="tab-panel active" id="tab-overview">
+      <h2>GPU 状态</h2>
+      <div id="gpu" class="grid"></div>
+      <h2>活跃模型</h2>
+      <div id="models"></div>
+      <div class="toolbar">
+        <button id="stopAll" class="danger">停止所有模型</button>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="tab-models">
+      <h2>快速启动</h2>
+      <div class="toolbar">
+        <input id="modelSearch" placeholder="输入或筛选可用模型 ID" />
+        <span id="availableCount" class="muted"></span>
+      </div>
+      <div id="availableModels" class="grid"></div>
+    </section>
+
+    <section class="tab-panel" id="tab-tools">
+      <div class="card">
+        <h3>从URL生成下载脚本 <a href="https://modelscope.cn/models" target="_blank" rel="noopener" class="muted">ModelScope 模型库</a></h3>
+        <div class="vform">
+          <div>
+            <label>模型页面URL</label>
+            <input id="msUrl" placeholder="https://www.modelscope.cn/models/Qwen/Qwen3-Next-80B-A3B-Instruct" />
+          </div>
+          <div>
+            <label>下载路径（默认 /datanfs4/renlin24/file/models/modelscope）</label>
+            <input id="msDestUrl" placeholder="/datanfs4/renlin24/file/models/modelscope" />
+          </div>
+          <div>
+            <label>tensor_parallel_size（默认1）</label>
+            <input id="msTPUrl" placeholder="1" />
+          </div>
+          <div>
+            <label>gpu_memory_utilization（可选）</label>
+            <input id="msGMUUrl" placeholder="0.85" />
+          </div>
+          <div>
+            <button id="msPrepBtn">生成下载脚本</button>
+            <button id="msYamlOnlyBtn">生成 YAML</button>
+          </div>
+        </div>
+        <div id="msPrepResult" class="card" style="display:none;">
+          <div class="row">Model ID: <span id="msModelId"></span></div>
+          <div class="row">YAML: <span id="msYamlPath"></span></div>
+          <textarea id="msScript" class="codebox" readonly></textarea>
+          <div class="toolbar">
+            <button id="msCopyBtn">复制脚本</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>手动刷新模式</span>
+  </footer>
+
+  <script>
+    async function fetchJson(url, opts) {
+      const res = await fetch(url, opts)
+      return res.json()
+    }
+
+    function el(tag, cls, text) {
+      const e = document.createElement(tag)
+      if (cls) e.className = cls
+      if (text !== undefined) e.textContent = text
+      return e
+    }
+
+    // 图表已移除，保留简单信息展示
+
+    function renderSystem(data) {
+      const box = document.getElementById('sys')
+      box.innerHTML = ''
+      if (!data.success && data.psutil_available === undefined) {
+        box.textContent = '系统信息不可用'
+        return
+      }
+      const wrap = el('div', 'card')
+      const cpuPct = Number(data.cpu_percent ?? 0)
+      const memUsed = Number(data.memory_used_mb ?? 0)
+      const memTotal = Number(data.memory_total_mb ?? 1)
+      const memPct = Math.min(100, Math.max(0, Math.round((memUsed / memTotal) * 100)))
+
+      const cpuRow = el('div', 'row')
+      cpuRow.append(el('span', 'tag', 'CPU'), el('span', 'stat', `${cpuPct}%`))
+      const cpuProg = el('div', 'progress')
+      const cpuBar = el('div', 'progress-bar')
+      cpuBar.style.width = `${cpuPct}%`
+      cpuProg.append(cpuBar)
+
+      const memRow = el('div', 'row')
+      memRow.append(el('span', 'tag', '内存'), el('span', 'stat', `${memUsed} / ${memTotal} MB (${memPct}%)`))
+      const memProg = el('div', 'progress')
+      const memBar = el('div', 'progress-bar')
+      memBar.style.width = `${memPct}%`
+      memProg.append(memBar)
+
+      wrap.append(
+        el('div', 'row', `主机: ${data.hostname}`),
+        el('div', 'row', `平台: ${data.platform}`),
+        cpuRow,
+        cpuProg,
+        memRow,
+        memProg,
+        el('div', 'row', `磁盘: ${data.disk_used_gb ?? '-'} / ${data.disk_total_gb ?? '-'} GB`),
+      )
+      box.append(wrap)
+    }
+
+    function renderGPU(data) {
+      const box = document.getElementById('gpu')
+      box.innerHTML = ''
+      if (!data.success) {
+        box.textContent = '无法获取 GPU 信息（可能未安装 pynvml）'
+        return
+      }
+      data.gpus.forEach(g => {
+        const card = el('div', 'card')
+        const header = el('div', 'row')
+        header.append(el('span', 'tag', `GPU${g.index}`), el('span', 'gpu-name', ` ${g.name}`))
+        const util = Number(g.utilization_gpu_percent ?? 0)
+        const memPct = Math.min(100, Math.max(0, Math.round((g.memory_used_mb / Math.max(1, g.memory_total_mb)) * 100)))
+
+        const memRow = el('div', 'row')
+        memRow.append(el('span', 'tag', '显存'), el('span', 'stat', `${g.memory_used_mb}/${g.memory_total_mb} MB (空闲 ${g.memory_free_mb} MB)`))
+        const memProg = el('div', 'progress')
+        const memBar = el('div', 'progress-bar')
+        memBar.style.width = `${memPct}%`
+        memProg.append(memBar)
+
+        const info = el('div', 'row muted')
+        info.textContent = `利用率: ${util}%  温度: ${g.temperature_c ?? '-'}°C  功耗: ${g.power_draw_w ?? '-'}W`
+        
+        card.append(header, memRow, memProg, info)
+        const plist = el('div', 'proc')
+        g.processes.forEach(p => {
+          plist.append(el('div', 'row', `PID ${p.pid} ${p.username} (${p.used_gpu_memory_mb} MB)`))
+        })
+        if (!g.processes.length) plist.append(el('div', 'row', '无计算进程'))
+        card.append(plist)
+        box.append(card)
+      })
+    }
+
+    let pendingRefreshTimer = null
+
+    function statusText(s) {
+      switch ((s || '').toUpperCase()) {
+        case 'STARTING': return '启动中'
+        case 'STARTED': return '已启动'
+        case 'FAILED': return '启动失败'
+        case 'INVALID': return '无效'
+        default: return s || '-'
+      }
+    }
+
+    function renderModels(data) {
+      const box = document.getElementById('models')
+      box.innerHTML = ''
+      if (!data.success) {
+        box.textContent = '无法获取模型列表'
+        return
+      }
+      if (!data.models.length) {
+        box.textContent = '暂无活跃模型'
+        return
+      }
+      let hasStarting = false
+      data.models.forEach(m => {
+        const card = el('div', 'card')
+        card.append(
+          el('div', 'row', `名称: ${m.name}`),
+          el('div', 'row', `状态: ${statusText(m.status)}`),
+          el('div', 'row', `端口: ${m.port ?? '-'} PID: ${m.pid ?? '-'}`),
+          el('div', 'row', `上次访问: ${m.last_access}`),
+        )
+        if (m.status === 'FAILED' && m.error) {
+          card.append(el('div', 'row muted', `错误: ${m.error}`))
+        }
+        if (m.status === 'STARTING') hasStarting = true
+        const btn = el('button', 'danger', '停止')
+        btn.onclick = async () => {
+          await fetchJson('/api/admin/stop_model', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model: m.name})})
+          await refresh()
+        }
+        card.append(btn)
+        box.append(card)
+      })
+      // 若存在启动中的模型，则自动轮询刷新，避免手动点刷新
+      if (hasStarting) {
+        if (pendingRefreshTimer) clearTimeout(pendingRefreshTimer)
+        pendingRefreshTimer = setTimeout(refresh, 3000)
+      }
+    }
+
+    function renderAvailable(models) {
+      const box = document.getElementById('availableModels')
+      const kw = (document.getElementById('modelSearch').value || '').toLowerCase()
+      box.innerHTML = ''
+      const filtered = models.filter(m => m.id.toLowerCase().includes(kw))
+      document.getElementById('availableCount').textContent = `共 ${filtered.length} 个`;
+      filtered.forEach(m => {
+        const card = el('div', 'card')
+        card.append(
+          el('div', 'row', m.id),
+        )
+        const btn = el('button', '', '启动')
+        btn.onclick = async () => {
+          btn.disabled = true
+          btn.textContent = '启动中...'
+          try {
+            const res = await fetchJson('/api/admin/models/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model: m.id})})
+            if (!res.success) alert(res.message || '启动失败')
+            await refresh()
+          } finally {
+            btn.disabled = false
+            btn.textContent = '启动'
+          }
+        }
+        card.append(btn)
+        box.append(card)
+      })
+    }
+
+    async function refresh() {
+      const [sys, gpu, models, avail] = await Promise.all([
+        fetchJson('/api/admin/system'),
+        fetchJson('/api/admin/gpu'),
+        fetchJson('/api/admin/models'),
+        fetchJson('/api/admin/models/available'),
+      ])
+      // system API wraps success True in app.py
+      renderSystem(sys)
+      renderGPU(gpu)
+      renderModels(models)
+      if (avail.success) renderAvailable(avail.models)
+    }
+
+    document.getElementById('stopAll').onclick = async () => {
+      await fetchJson('/api/admin/stop_all', {method: 'POST'})
+      await refresh()
+    }
+
+    document.getElementById('refreshBtn').onclick = () => { refresh() }
+    refresh()
+
+    // Tabs
+    function activateTab(id){
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'))
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'))
+      const tab = document.querySelector(`.tab[data-tab="${id}"]`)
+      const panel = document.getElementById(id)
+      if (tab) tab.classList.add('active')
+      if (panel) panel.classList.add('active')
+    }
+    document.querySelectorAll('.tab').forEach(t => {
+      t.onclick = () => activateTab(t.getAttribute('data-tab'))
+    })
+
+    document.getElementById('modelSearch').addEventListener('input', async () => {
+      try {
+        const avail = await fetchJson('/api/admin/models/available')
+        if (avail.success) renderAvailable(avail.models)
+      } catch {}
+    })
+
+    // 已移除 ModelScope 列表与任务，保留从URL生成脚本工具
+
+    // 从URL生成下载脚本
+    document.getElementById('msPrepBtn').onclick = async () => {
+      const url = (document.getElementById('msUrl').value || '').trim()
+      if (!url) {
+        alert('请输入模型页面URL')
+        return
+      }
+      const payload = { url }
+      const dest = (document.getElementById('msDestUrl').value || '').trim()
+      if (dest) payload.dest_dir = dest
+      const tpRaw = (document.getElementById('msTPUrl').value || '').trim()
+      const tp = parseInt(tpRaw)
+      if (!Number.isNaN(tp) && tp > 0) payload.tensor_parallel_size = tp
+      const gmuRaw = (document.getElementById('msGMUUrl').value || '').trim()
+      const gmu = parseFloat(gmuRaw)
+      if (!Number.isNaN(gmu)) payload.gpu_memory_utilization = gmu
+
+      try {
+        const res = await fetchJson('/api/admin/modelscope/prepare_from_url', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)})
+        if (!res.success) { alert(res.message || '生成脚本失败'); return }
+        document.getElementById('msModelId').textContent = res.model_id || ''
+        document.getElementById('msScript').value = res.script || ''
+        // 仅脚本：显示建议的 YAML 路径但不生成
+        document.getElementById('msYamlPath').textContent = res.yaml_path || ''
+        document.getElementById('msPrepResult').style.display = 'block'
+      } catch (e) {
+        alert('请求失败: ' + e)
+      }
+    }
+
+    // 仅生成 YAML
+    document.getElementById('msYamlOnlyBtn').onclick = async () => {
+      const url = (document.getElementById('msUrl').value || '').trim()
+      if (!url) { alert('请输入模型页面URL'); return }
+      const payload = { url }
+      const dest = (document.getElementById('msDestUrl').value || '').trim()
+      if (dest) payload.dest_dir = dest
+      const tpRaw = (document.getElementById('msTPUrl').value || '').trim()
+      const tp = parseInt(tpRaw)
+      const gmuRaw = (document.getElementById('msGMUUrl').value || '').trim()
+      const gmu = parseFloat(gmuRaw)
+
+      try {
+        const res = await fetchJson('/api/admin/modelscope/prepare_from_url', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)})
+        if (!res.success) { alert(res.message || '解析 URL 失败'); return }
+        const destToUse = dest || '/datanfs4/renlin24/file/models/modelscope'
+        const baseDir = destToUse.replace(/\\/g, '/').replace(/\/+$/, '')
+        const modelLocalDir = `${baseDir}/models/${res.model_id}`
+        const yamlPayload = { model_id: res.model_id, local_dir: modelLocalDir }
+        if (!Number.isNaN(tp) && tp > 0) yamlPayload.tensor_parallel_size = tp
+        if (!Number.isNaN(gmu)) yamlPayload.gpu_memory_utilization = gmu
+        const y = await fetchJson('/api/admin/modelscope/write_yaml', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(yamlPayload)})
+        if (!y.success) { document.getElementById('msYamlPath').textContent = res.yaml_path || ''; alert(y.message || '生成 YAML 失败'); return }
+        document.getElementById('msModelId').textContent = res.model_id || ''
+        document.getElementById('msYamlPath').textContent = y.yaml_path || (res.yaml_path || '')
+        document.getElementById('msPrepResult').style.display = 'block'
+        alert('YAML 已生成')
+      } catch (e) {
+        alert('请求失败: ' + e)
+      }
+    }
+
+    document.getElementById('msCopyBtn').onclick = async () => {
+      const txt = document.getElementById('msScript').value || ''
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(txt)
+        } else {
+          const ta = document.getElementById('msScript')
+          ta.focus()
+          ta.select()
+          document.execCommand('copy')
+        }
+        alert('已复制到剪贴板')
+      } catch (e) {
+        alert('复制失败: ' + e)
+      }
+    }
+
+  </script>
+</body>
+</html>
+
+

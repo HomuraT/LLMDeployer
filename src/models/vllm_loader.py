@@ -352,11 +352,14 @@ class VLLMServer:
                 # Open log file for writing
                 log_handle = open(log_file, 'w')
 
+                # 为避免子进程被意外杀死，禁用 PDEATHSIG 行为
+                preexec = None
                 self.process = subprocess.Popen(
                     cmd_list,
                     env=env,
                     shell=False, # MUST be False for preexec_fn
                     start_new_session=True, # Creates independent process group
+                    preexec_fn=preexec, # Ensure child gets SIGKILL if parent dies (Linux)
                     stdout=log_handle, # Redirect stdout
                     stderr=log_handle  # Redirect stderr to same file
                 )
@@ -387,11 +390,19 @@ class VLLMServer:
                 self.process = None
                 self.pid = None
                 raise RuntimeError(f"Subprocess Popen failed for {self.model_name}") from e
+            finally:
+                # 关闭父进程的日志句柄，避免FD泄漏；子进程已继承描述符
+                try:
+                    if log_handle and not log_handle.closed:
+                        log_handle.flush()
+                        log_handle.close()
+                except Exception:
+                    pass
 
             # Wait until the port can respond
-            url = f'http://localhost:{self.port}/health' # Use /health endpoint if available, fallback to /v1/models
+            url = f'http://127.0.0.1:{self.port}/health' # Prefer 127.0.0.1 over localhost to avoid IPv6/proxy issues
             wait_start_time = time.time()
-            max_wait_time = 1200 # 5 minutes max wait time
+            max_wait_time = 300 # 5 minutes -> 300s，实际为5分钟，此处取300s并改进重试
             connected = False
 
             proxies = {
@@ -410,7 +421,7 @@ class VLLMServer:
                     r = requests.get(url, timeout=2, proxies=proxies)
                     # Also check /v1/models as a fallback
                     if r.status_code == 200:
-                         models_url = f'http://localhost:{self.port}/v1/models'
+                         models_url = f'http://127.0.0.1:{self.port}/v1/models'
                          try:
                              models_r = requests.get(models_url, timeout=2, proxies=proxies)
                              if models_r.status_code == 200:
@@ -419,8 +430,8 @@ class VLLMServer:
                          except requests.exceptions.RequestException:
                              pass # /v1/models might not be ready yet even if /health is
                     # If /health failed, try /v1/models directly
-                    elif url == f'http://localhost:{self.port}/health':
-                         models_url = f'http://localhost:{self.port}/v1/models'
+                    elif url == f'http://127.0.0.1:{self.port}/health':
+                         models_url = f'http://127.0.0.1:{self.port}/v1/models'
                          try:
                              models_r = requests.get(models_url, timeout=2, proxies=proxies)
                              if models_r.status_code == 200:
@@ -450,7 +461,7 @@ class VLLMServer:
 
             # Server is up, create client
             self.client = OpenAI(
-                base_url=f'http://localhost:{self.port}/v1',
+                base_url=f'http://127.0.0.1:{self.port}/v1',
                 api_key='null', # vLLM OpenAI endpoint doesn't require a key
             )
             self.logger.info(f'{self.model_name} started successfully on port {self.port} with PID {self.pid}')
@@ -567,26 +578,19 @@ class VLLMServer:
             # Get children before killing parent
             children = parent.children(recursive=True)
 
-            # --- Try SIGINT on parent first --- Allows VLLM potentially cleaner shutdown
-            self.logger.info(f"Sending SIGINT to parent process {pid_to_kill}...")
+            # --- 首先优雅结束父进程本身 ---
             try:
-                # Use os.kill for sending signals directly if psutil doesn't have .interrupt()
-                # Or parent.send_signal(signal.SIGINT) if using newer psutil
-                # Check psutil documentation for the best cross-platform way
-                # For Linux/macOS, os.kill is reliable
-                import os
-                import signal
-                os.kill(pid_to_kill, signal.SIGINT)
-                parent.wait(timeout=5) # Wait up to 5 seconds for graceful exit
-                self.logger.info(f"Parent process {pid_to_kill} potentially exited after SIGINT.")
+                parent.terminate() # SIGTERM
+            except Exception:
+                pass
+            try:
+                parent.wait(timeout=5)
             except psutil.TimeoutExpired:
-                self.logger.warning(f"Parent process {pid_to_kill} did not exit after SIGINT within timeout.")
-                # Proceed with child termination and more forceful parent termination
-            except psutil.NoSuchProcess:
-                self.logger.info(f"Parent process {pid_to_kill} exited before or during SIGINT wait.")
-                parent = None # Mark parent as gone
-            except Exception as sigint_err:
-                self.logger.error(f"Error sending SIGINT to parent process {pid_to_kill}: {sigint_err}")
+                self.logger.warning(f"Parent {pid_to_kill} did not exit after SIGTERM within timeout. Sending SIGKILL...")
+                try:
+                    parent.kill() # SIGKILL
+                except Exception:
+                    pass
 
             # --- Terminate Children (if parent still exists or we need to be sure) ---
             # Re-fetch children if parent might have spawned new ones or some exited
@@ -616,21 +620,8 @@ class VLLMServer:
                         pass
                 self.logger.info("Child process termination attempts complete.")
 
-            # --- Terminate Parent (if still running) ---
-            if parent and parent.is_running():
-                 self.logger.info(f"Parent process {pid_to_kill} still running. Sending SIGTERM...")
-                 try:
-                     parent.terminate() # Try graceful termination (SIGTERM)
-                     parent.wait(timeout=5) # Wait for termination
-                     self.logger.info(f"Parent process {pid_to_kill} terminated gracefully after SIGTERM.")
-                 except psutil.TimeoutExpired:
-                     self.logger.warning(f"Parent process {pid_to_kill} did not terminate gracefully after SIGTERM. Sending SIGKILL...")
-                     parent.kill() # Force kill if necessary (SIGKILL)
-                     parent.wait() # Wait after kill
-                     self.logger.info(f"Parent process {pid_to_kill} killed forcefully.")
-                 except psutil.NoSuchProcess:
-                     self.logger.info(f"Parent process {pid_to_kill} exited during SIGTERM wait.")
-            elif parent is None:
+            # --- 兜底：若对象丢失 ---
+            if parent is None:
                  # Parent already exited (likely after SIGINT or before we checked)
                  self.logger.info(f"Parent process {pid_to_kill} was already terminated.")
 
@@ -641,6 +632,12 @@ class VLLMServer:
         except Exception as e:
             self.logger.error(f"Error during kill_server for {model_name_killed} (PID: {pid_to_kill}): {e}")
         finally:
+            # 尝试回收 Popen 对象，确保不留僵尸
+            try:
+                if self.process is not None:
+                    self.process.wait(timeout=1)
+            except Exception:
+                pass
             # --- Add cleanup for potential orphaned multiprocessing processes ---
             self.logger.info(f"Scanning for potential orphaned multiprocessing processes related to PID {pid_to_kill}...")
             cleaned_orphans = False

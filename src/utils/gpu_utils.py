@@ -15,7 +15,7 @@ except ImportError:
     logger.warning("psutil library not found. Username information for GPU processes will not be available.")
 
 # Add docstring typing and PyCharm style comments
-def find_available_gpu(model_name: str | None = None, min_memory_mb: int = 24000) -> list[int] | None:
+def find_available_gpu(model_name: str | None = None, min_memory_mb: int = 24000, exclude_gpus: list[int] | None = None) -> list[int] | None:
     """
     Find available GPUs based on free memory using pynvml, optionally adjusting min_memory_mb.
 
@@ -23,6 +23,8 @@ def find_available_gpu(model_name: str | None = None, min_memory_mb: int = 24000
     :type model_name: str | None
     :param min_memory_mb: Minimum free memory required in Megabytes.
     :type min_memory_mb: int
+    :param exclude_gpus: Optional; GPU indices to exclude from consideration (e.g., reserved during startup).
+    :type exclude_gpus: list[int] | None
     :return: A list of suitable GPU indices, or None if no suitable GPU is found or pynvml is unavailable.
     :rtype: list[int] | None
     """
@@ -45,6 +47,7 @@ def find_available_gpu(model_name: str | None = None, min_memory_mb: int = 24000
 
     selected_gpus = []
     max_memory = -1
+    exclude_set = set(exclude_gpus or [])
 
     try:
         pynvml.nvmlInit()
@@ -52,6 +55,9 @@ def find_available_gpu(model_name: str | None = None, min_memory_mb: int = 24000
         logger.info(f"Found {device_count} GPUs.")
 
         for i in range(device_count):
+            if i in exclude_set:
+                logger.info(f"Skipping GPU {i} because it is in exclude_gpus: {sorted(list(exclude_set))}")
+                continue
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
             try:
                 mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
@@ -165,6 +171,141 @@ def find_available_gpu(model_name: str | None = None, min_memory_mb: int = 24000
 # except FileNotFoundError:
 #     logging.error("nvidia-smi command not found. Please ensure NVIDIA drivers and tools are installed.")
 #     return None
+
+
+def get_gpu_stats() -> dict:
+    """
+    收集 GPU 统计信息（类似 gpustat 的关键信息）。
+
+    返回结构:
+    {
+      "success": bool,
+      "gpus": [
+        {
+          "index": int,
+          "name": str,
+          "memory_total_mb": int,
+          "memory_used_mb": int,
+          "memory_free_mb": int,
+          "utilization_gpu_percent": int | None,
+          "temperature_c": int | None,
+          "power_draw_w": float | None,
+          "processes": [
+            {"pid": int, "username": str, "used_gpu_memory_mb": int}
+          ]
+        }
+      ],
+      "device_count": int
+    }
+    """
+    if not pynvml:
+        return {
+            "success": False,
+            "message": "pynvml not installed",
+            "gpus": [],
+            "device_count": 0,
+        }
+
+    gpus = []
+    try:
+        pynvml.nvmlInit()
+        device_count = pynvml.nvmlDeviceGetCount()
+
+        for i in range(device_count):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            try:
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                raw_name = pynvml.nvmlDeviceGetName(handle) if hasattr(pynvml, "nvmlDeviceGetName") else None
+                try:
+                    if isinstance(raw_name, (bytes, bytearray)):
+                        name = raw_name.decode("utf-8", errors="ignore")
+                    elif raw_name is not None:
+                        name = str(raw_name)
+                    else:
+                        name = f"GPU-{i}"
+                except Exception:
+                    name = f"GPU-{i}"
+
+                util = None
+                try:
+                    util_struct = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    util = int(util_struct.gpu)
+                except Exception:
+                    util = None
+
+                temp = None
+                try:
+                    temp = int(pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU))
+                except Exception:
+                    temp = None
+
+                power = None
+                try:
+                    power = float(pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0)
+                except Exception:
+                    power = None
+
+                proc_list = []
+                try:
+                    processes = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+                    if not processes:
+                        # Fallback to graphics processes to show more context if compute list is empty
+                        try:
+                            processes = pynvml.nvmlDeviceGetGraphicsRunningProcesses(handle)
+                        except Exception:
+                            processes = []
+                    for p in processes:
+                        pid = int(p.pid)
+                        used_val = getattr(p, 'usedGpuMemory', 0) or 0
+                        try:
+                            used_mb = int(max(0, used_val // (1024 * 1024)))
+                        except Exception:
+                            used_mb = 0
+                        username = ""
+                        if psutil:
+                            try:
+                                username = psutil.Process(pid).username()
+                            except Exception:
+                                username = ""
+                        proc_list.append({
+                            "pid": pid,
+                            "username": username,
+                            "used_gpu_memory_mb": used_mb,
+                        })
+                except Exception:
+                    proc_list = []
+
+                gpus.append({
+                    "index": i,
+                    "name": name,
+                    "memory_total_mb": int(mem.total // (1024 * 1024)),
+                    "memory_used_mb": int(mem.used // (1024 * 1024)),
+                    "memory_free_mb": int(mem.free // (1024 * 1024)),
+                    "utilization_gpu_percent": util,
+                    "temperature_c": temp,
+                    "power_draw_w": power,
+                    "processes": proc_list,
+                })
+            except Exception as e:
+                logger.warning(f"Failed to read stats for GPU {i}: {e}")
+
+        return {
+            "success": True,
+            "gpus": gpus,
+            "device_count": len(gpus),
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": str(e),
+            "gpus": [],
+            "device_count": 0,
+        }
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
 # except subprocess.TimeoutExpired:
 #     logging.error("nvidia-smi command timed out after 10 seconds. GPU might be unresponsive.")
 #     return None

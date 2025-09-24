@@ -17,3 +17,4 @@ __pycache__/
 
 .ipynb_checkpoints/
 run_api.pid
+resources/vllm_models

@@ -1,6 +1,0 @@
-vllm:
-  tensor_parallel_size: 1
-  gpu_memory_utilization: 0.9
-  tool-call-parser: llama3_json
-  model: /seu_share/home/qiguilin/230248999/file/models/models/LLM-Research/Meta-Llama-3.1-8B-Instruct
-  served-model-name: meta-llama/Llama-3.1-8B-Instruct

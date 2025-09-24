@@ -1,6 +1,0 @@
-vllm:
-    model: /seu_share/home/qiguilin/230248999/file/models/models/Qwen/Qwen3-14B
-    served-model-name: Qwen/Qwen3-14B
-    tensor_parallel_size: 1
-    gpu_memory_utilization: 0.9
-    tool-call-parser: hermes

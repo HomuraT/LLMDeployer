@@ -1,7 +1,0 @@
-vllm:
-  model: /datanfs4/renlin24/file/models/modelscope/models/Qwen/Qwen3-0___6B
-  served-model-name: Qwen/Qwen3-0.6B
-  tensor_parallel_size: 1
-  gpu_memory_utilization: 0.2
-  tool-call-parser: hermes
-  max_model_len: 1024

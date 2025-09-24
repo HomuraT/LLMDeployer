@@ -18,7 +18,7 @@ from src.utils.config_utils import VLLM_MODEL_CONFIG_BASE_PATH
 model_pool: Dict[str, Dict[str, Any]] = {}
 # 全局锁：仅用于短时访问/修改 model_pool 的元数据，避免长时间阻塞
 model_global_lock = threading.Lock()
-IDLE_TIMEOUT = timedelta(minutes=10) # Example: 10 minutes idle timeout
+IDLE_TIMEOUT = timedelta(minutes=60) # Example: 10 minutes idle timeout
 MODEL_TTL_MINUTES = 60 # Time-to-live for inactive models
 
 # 正在启动阶段已预留的 GPU 集合（避免并发选择相同 GPU 导致卡住）
@@ -136,7 +136,8 @@ def get_or_create_model(model_name: str) -> VLLMServer | None:
                 model_pool[model_name] = {
                     "creating": True,
                     "event": create_event,
-                    "last_access": datetime.now()
+                    "last_access": datetime.now(),
+                    "pinned": False,
                 }
                 am_creator = True
         else:
@@ -146,7 +147,8 @@ def get_or_create_model(model_name: str) -> VLLMServer | None:
             model_pool[model_name] = {
                 "creating": True,
                 "event": create_event,
-                "last_access": datetime.now()
+                "last_access": datetime.now(),
+                "pinned": False,
             }
             am_creator = True
 
@@ -209,11 +211,17 @@ def get_or_create_model(model_name: str) -> VLLMServer | None:
         server_instance = VLLMServer(model_name, cuda=pre_reserved)
         if (server_instance and server_instance.pid and server_instance.port and server_instance.client):
             with model_global_lock:
+                existing_pinned = False
+                try:
+                    existing_pinned = bool(model_pool.get(model_name, {}).get("pinned", False))
+                except Exception:
+                    existing_pinned = False
                 model_pool[model_name] = {
                     "server": server_instance,
                     "last_access": datetime.now(),
                     "last_healthy": datetime.now(),
-                    "unhealthy_count": 0
+                    "unhealthy_count": 0,
+                    "pinned": existing_pinned,
                 }
                 # 通知等待者
                 create_event.set()
@@ -284,6 +292,9 @@ def idle_cleaner():
                     continue
                 server_instance = info.get("server")
                 last_access_time = info.get("last_access")
+                # 跳过被固定的（不自动卸载）模型
+                if info.get("pinned"):
+                    continue
                 if isinstance(server_instance, VLLMServer) and isinstance(last_access_time, datetime):
                     if (now - last_access_time) > IDLE_TIMEOUT:
                         # 从池中移除，并记录待杀
@@ -316,6 +327,9 @@ def cleanup_inactive_models():
                 now = datetime.now()
                 inactive_models = []
                 for model_name, entry in model_pool.items():
+                    # 跳过被固定的（不自动卸载）模型
+                    if entry.get("pinned"):
+                        continue
                     # Check only valid VLLMServer instances
                     if isinstance(entry["server"], VLLMServer):
                         if now - entry["last_access"] > timedelta(minutes=MODEL_TTL_MINUTES):
@@ -478,7 +492,8 @@ def list_active_models() -> dict:
                 active_models.append({
                     'name': model_name,
                     'status': 'STARTING',
-                    'last_access': last_access.isoformat() if isinstance(last_access, datetime) else str(last_access)
+                    'last_access': last_access.isoformat() if isinstance(last_access, datetime) else str(last_access),
+                    'pinned': bool(entry.get('pinned', False)),
                 })
                 continue
             if entry.get("status") == "FAILED":
@@ -486,7 +501,8 @@ def list_active_models() -> dict:
                     'name': model_name,
                     'status': 'FAILED',
                     'error': entry.get('error'),
-                    'last_access': last_access.isoformat() if isinstance(last_access, datetime) else str(last_access)
+                    'last_access': last_access.isoformat() if isinstance(last_access, datetime) else str(last_access),
+                    'pinned': bool(entry.get('pinned', False)),
                 })
                 continue
             server_instance = entry.get("server")
@@ -495,6 +511,11 @@ def list_active_models() -> dict:
                 'status': 'STARTED' if isinstance(server_instance, VLLMServer) else 'INVALID',
                 'last_access': last_access.isoformat() if isinstance(last_access, datetime) else str(last_access)
             }
+            # 暴露 pinned 状态
+            try:
+                model_info['pinned'] = bool(entry.get('pinned', False))
+            except Exception:
+                model_info['pinned'] = False
             if isinstance(server_instance, VLLMServer):
                 model_info.update({
                     'pid': server_instance.pid,
@@ -507,6 +528,30 @@ def list_active_models() -> dict:
             'models': active_models,
             'total_count': len(active_models)
         }
+
+
+def set_model_pinned(model_name: str, pinned: bool) -> dict:
+    """
+    设置指定模型的保留标记（pinned）。仅对模型池中的现有条目生效。
+
+    Args:
+        model_name: 模型名称
+        pinned: 是否保留（True=不被自动卸载）
+
+    Returns:
+        dict: {success: bool, message: str, name: str, pinned: bool}
+    """
+    global model_pool, model_global_lock
+
+    with model_global_lock:
+        entry = model_pool.get(model_name)
+        if not entry or not isinstance(entry, dict):
+            return {'success': False, 'message': f'模型 {model_name} 不存在', 'name': model_name, 'pinned': False}
+        try:
+            entry['pinned'] = bool(pinned)
+            return {'success': True, 'message': 'OK', 'name': model_name, 'pinned': entry['pinned']}
+        except Exception as e:
+            return {'success': False, 'message': str(e), 'name': model_name, 'pinned': bool(entry.get('pinned', False))}
 
 
 def stop_all_models() -> dict:

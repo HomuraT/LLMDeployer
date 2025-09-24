@@ -201,17 +201,31 @@
           el('div', 'row', `状态: ${statusText(m.status)}`),
           el('div', 'row', `端口: ${m.port ?? '-'} PID: ${m.pid ?? '-'}`),
           el('div', 'row', `上次访问: ${m.last_access}`),
+          el('div', 'row', `保留: ${m.pinned ? '是' : '否'}`),
         )
         if (m.status === 'FAILED' && m.error) {
           card.append(el('div', 'row muted', `错误: ${m.error}`))
         }
         if (m.status === 'STARTING') hasStarting = true
+        const pinBtn = el('button', m.pinned ? 'secondary' : '', m.pinned ? '取消保留' : '保留')
+        pinBtn.onclick = async () => {
+          pinBtn.disabled = true
+          try {
+            const res = await fetchJson('/api/admin/models/pin', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model: m.name, pinned: !m.pinned})})
+            if (!res.success) alert(res.message || '操作失败')
+            await refresh()
+          } finally {
+            pinBtn.disabled = false
+          }
+        }
         const btn = el('button', 'danger', '停止')
         btn.onclick = async () => {
           await fetchJson('/api/admin/stop_model', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model: m.name})})
           await refresh()
         }
-        card.append(btn)
+        const actions = el('div', 'toolbar')
+        actions.append(pinBtn, btn)
+        card.append(actions)
         box.append(card)
       })
       // 若存在启动中的模型，则自动轮询刷新，避免手动点刷新

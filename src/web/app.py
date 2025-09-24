@@ -8,7 +8,7 @@ from flask import Flask, request, Response, jsonify, render_template, redirect, 
 # from pandas.tests.io.formats.test_to_html import justify # Removed unused import
 from rich.console import Console
 
-from src.web.multi_model_utils import get_or_create_model, idle_cleaner, stop_model, list_active_models, stop_all_models
+from src.web.multi_model_utils import get_or_create_model, idle_cleaner, stop_model, list_active_models, stop_all_models, set_model_pinned
 from src.models.vllm_loader import VLLMServer # Import VLLMServer for type hinting and error handling
 from src.utils.log_config import logger
 from src.utils.gpu_utils import get_gpu_stats
@@ -443,6 +443,23 @@ def admin_list_available_models():
         return jsonify({"success": True, "models": models, "total": len(models)}), 200
     except Exception as e:
         logger.error(f"Error listing available models: {e}")
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route('/api/admin/models/pin', methods=['POST'])
+def admin_pin_model():
+    try:
+        data = request.get_json(silent=True) or {}
+        model_name = data.get('model')
+        if not model_name:
+            return jsonify({"success": False, "message": "Missing 'model'"}), 400
+        if 'pinned' not in data:
+            return jsonify({"success": False, "message": "Missing 'pinned'"}), 400
+        pinned = bool(data.get('pinned'))
+        result = set_model_pinned(model_name, pinned)
+        return jsonify(result), (200 if result.get('success') else 400)
+    except Exception as e:
+        logger.error(f"Error setting pinned for {model_name if 'model_name' in locals() else ''}: {e}")
         return jsonify({"success": False, "message": str(e)}), 500
 
 

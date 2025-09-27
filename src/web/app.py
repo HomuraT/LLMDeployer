@@ -626,6 +626,66 @@ def admin_modelscope_prepare_from_url():
         return jsonify({"success": False, "message": str(e)}), 500
 
 
+def _extract_model_name_from_request():
+    """从query/json/form/headers中提取模型名。"""
+    m = request.args.get('model')
+    if not m and request.is_json:
+        data = request.get_json(silent=True) or {}
+        if isinstance(data, dict):
+            m = data.get('model')
+    if not m and request.form:
+        m = request.form.get('model')
+    if not m:
+        m = request.headers.get('X-Model')
+    return m
+
+
+@app.route('/<path:subpath>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'])
+def vllm_generic_proxy(subpath):
+    """
+    兜底转发：当未命中显式实现的路由，且请求中能提取到模型名(model)时，
+    将请求透明转发到对应vLLM实例的相同路径。
+    """
+    model_name = _extract_model_name_from_request()
+    if not model_name:
+        return jsonify({"error": "Not Found and no 'model' provided to forward"}), 404
+
+    llm: VLLMServer = get_or_create_model(model_name)
+    if not llm or not llm.port:
+        return jsonify({"error": f"Service for model {model_name} is unavailable or failed to start."}), 503
+
+    forward_url = f"http://127.0.0.1:{llm.port}/{subpath}"
+
+    # 过滤不应透传的头部
+    excluded_req_headers = {'host', 'content-length', 'transfer-encoding', 'connection'}
+    fwd_headers = {k: v for k, v in request.headers if k.lower() not in excluded_req_headers}
+
+    upstream = requests.request(
+        method=request.method,
+        url=forward_url,
+        params=request.args,
+        data=request.get_data(),
+        headers=fwd_headers,
+        stream=True,
+        timeout=requests_time_out,
+        proxies={"http": None, "https": None},
+    )
+
+    def generate():
+        for chunk in upstream.iter_content(chunk_size=8192):
+            if chunk:
+                yield chunk
+
+    excluded_resp_headers = {'content-encoding', 'content-length', 'transfer-encoding', 'connection'}
+    resp_headers = [(k, v) for k, v in upstream.headers.items() if k.lower() not in excluded_resp_headers]
+    return Response(
+        generate(),
+        status=upstream.status_code,
+        headers=resp_headers,
+        content_type=upstream.headers.get('content-type')
+    )
+
+
 def run():
     """CLI entrypoint to run the Flask App."""
     parser = argparse.ArgumentParser(description="Run text-generation model with specified parameters.")

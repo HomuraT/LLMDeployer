@@ -49,6 +49,35 @@ def _read_tp_size_from_yaml(model_name: str) -> int:
         return 1
 
 
+def _yaml_specifies_cuda(model_name: str) -> bool:
+    """
+    检测模型 YAML 是否通过 env.CUDA_VISIBLE_DEVICES 指定了 GPU。
+    若已指定，则上层应跳过自动 GPU 预留/选择逻辑。
+    """
+    try:
+        yaml_path1 = os.path.join(VLLM_MODEL_CONFIG_BASE_PATH, model_name + '.yaml')
+        yaml_path2 = os.path.join(VLLM_MODEL_CONFIG_BASE_PATH, model_name.replace('/', '_') + '.yaml')
+        yaml_path = yaml_path1 if os.path.exists(yaml_path1) else yaml_path2
+        if not os.path.exists(yaml_path):
+            return False
+        cfg = YAMLConfigManager.read_yaml(yaml_path)
+        if not isinstance(cfg, dict):
+            return False
+        env_cfg = cfg.get('env')
+        if not isinstance(env_cfg, dict):
+            return False
+        val = env_cfg.get('CUDA_VISIBLE_DEVICES')
+        if val is None:
+            return False
+        # 空字符串也视为“未指定具体GPU”，因此需要非空判断
+        try:
+            return str(val).strip() != ''
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
 def _reserve_gpus_for_start(model_name: str, tp_size: int, wait_timeout_sec: int = 180) -> Optional[list[int]]:
     """
     并发安全地为模型启动预留 tp_size 个 GPU；在超时时间内不断尝试。
@@ -191,23 +220,29 @@ def get_or_create_model(model_name: str) -> VLLMServer | None:
     # 我们负责创建的路径：锁外执行耗时操作
     server_instance: VLLMServer | None = None
     try:
-        # 读取 tp_size，并按数量进行并发安全的 GPU 预留
+        # 若 YAML 已指定 CUDA_VISIBLE_DEVICES，则跳过自动 GPU 预留
+        yaml_has_cuda = _yaml_specifies_cuda(model_name)
         tp_size = _read_tp_size_from_yaml(model_name)
         if tp_size < 1:
             tp_size = 1
-        pre_reserved = _reserve_gpus_for_start(model_name, tp_size)
-        if not pre_reserved:
-            logger.error(f"未找到适合模型 {model_name} 的GPU，无法创建服务器")
-            # 标记失败并清理占位
-            with model_global_lock:
-                model_pool[model_name] = {
-                    "status": "FAILED",
-                    "error": "NO_SUITABLE_GPU",
-                    "last_access": datetime.now()
-                }
-            return None
-        # 在占用列表基础上创建 VLLMServer（其内部会再根据 tp_size 进行校验及 env 设置）
-        logger.info(f"为模型 {model_name} 在GPU {pre_reserved} 上创建VLLMServer（按 tp_size={tp_size} 预留）")
+
+        pre_reserved: Optional[list[int]] = None
+        if not yaml_has_cuda:
+            pre_reserved = _reserve_gpus_for_start(model_name, tp_size)
+            if not pre_reserved:
+                logger.error(f"未找到适合模型 {model_name} 的GPU，无法创建服务器")
+                with model_global_lock:
+                    model_pool[model_name] = {
+                        "status": "FAILED",
+                        "error": "NO_SUITABLE_GPU",
+                        "last_access": datetime.now()
+                    }
+                return None
+            logger.info(f"为模型 {model_name} 在GPU {pre_reserved} 上创建VLLMServer（按 tp_size={tp_size} 预留）")
+        else:
+            logger.info(f"检测到 YAML 指定 CUDA_VISIBLE_DEVICES，跳过自动 GPU 预留以使用 YAML 环境配置。")
+
+        # 根据是否预留传入 cuda 参数（None 表示让子进程依 YAML/系统环境决定）
         server_instance = VLLMServer(model_name, cuda=pre_reserved)
         if (server_instance and server_instance.pid and server_instance.port and server_instance.client):
             with model_global_lock:
@@ -226,7 +261,8 @@ def get_or_create_model(model_name: str) -> VLLMServer | None:
                 # 通知等待者
                 create_event.set()
             # 启动成功后释放预留（此时进程已占用显存，不再需要“软预留”）
-            _release_reserved_gpus(pre_reserved)
+            if pre_reserved:
+                _release_reserved_gpus(pre_reserved)
             logger.info(f"VLLMServer创建成功: {model_name} (PID: {server_instance.pid}, Port: {server_instance.port})")
             return server_instance
         else:
@@ -242,7 +278,8 @@ def get_or_create_model(model_name: str) -> VLLMServer | None:
                     "error": "INIT_VALIDATION_FAILED",
                     "last_access": datetime.now()
                 }
-            _release_reserved_gpus(pre_reserved)
+            if pre_reserved:
+                _release_reserved_gpus(pre_reserved)
             return None
     except Exception as e:
         logger.error(f"创建VLLMServer时发生异常: {model_name}: {e}")

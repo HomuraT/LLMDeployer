@@ -1,70 +1,21 @@
 import os
-import signal
 import subprocess
 import socket
 import time
 import threading
 import datetime
 import sys
-# Add imports for prctl
-import ctypes
-import platform # To check OS
 
 import psutil
 import requests
 from huggingface_hub import login
 from openai import OpenAI
-from tqdm import tqdm
 from vllm import LLM
 
 from src.utils.config_utils import VLLM_MODEL_CONFIG_BASE_PATH
-from src.utils.process_utils import get_pid_by_grep
 from src.utils.yaml_utils import YAMLConfigManager
 # Import the new logging system
 from src.utils.log_config import logger, get_model_logger, cleanup_model_logger
-
-# --- Additions for preexec_fn ---
-IS_LINUX = platform.system() == "Linux"
-PR_SET_PDEATHSIG = 1 # Linux specific constant
-libc = None
-prctl_syscall = None
-can_use_prctl = False
-
-if IS_LINUX:
-    try:
-        libc = ctypes.CDLL("libc.so.6")
-        prctl_syscall = libc.prctl
-        prctl_syscall.argtypes = [ctypes.c_int, ctypes.c_ulong]
-        prctl_syscall.restype = ctypes.c_int
-        can_use_prctl = True
-        logger.info("Successfully loaded libc and prctl for PDEATHSIG.")
-    except OSError as e:
-        logger.warning(f"Could not load libc or find prctl: {e}. PDEATHSIG functionality disabled.")
-        libc = None
-        prctl_syscall = None
-else:
-    logger.info("Not running on Linux. PDEATHSIG functionality is not available.")
-
-def set_pdeathsig_kill():
-    """
-    Sets the parent death signal to SIGKILL for the current process (Linux only).
-    To be used as preexec_fn in subprocess.Popen.
-
-    Input: None
-    Output: None
-    """
-    # This function runs *in the child process* before exec.
-    if IS_LINUX and can_use_prctl and prctl_syscall is not None:
-        try:
-            ret = prctl_syscall(PR_SET_PDEATHSIG, signal.SIGKILL)
-            if ret != 0:
-                # Try to get errno if possible, might be tricky in preexec_fn
-                logger.warning(f"prctl(PR_SET_PDEATHSIG, SIGKILL) failed in child with return code {ret}")
-        except Exception as e:
-            # Logging might be difficult here depending on FD setup,
-            # but attempt anyway. A failure here shouldn't prevent startup.
-            logger.warning(f"Exception calling prctl in child: {e}")
-# --- End Additions ---
 
 def load_model(model_name:str, vllm_config=None)->LLM | None:
     # Add Type Hinting for return value
@@ -193,6 +144,9 @@ class VLLMServer:
         if 'vllm' not in config:
             config['vllm'] = {}
 
+        # Extract env overrides (YAML优先覆盖进程环境)。缺省返回空字典
+        self._env_overrides = config.get('env', {})
+
         # Apply overrides passed during instantiation
         config['vllm'].update(self._vllm_config_override)
         vllm_config = config['vllm']
@@ -241,9 +195,6 @@ class VLLMServer:
             # --- ModelScope Integration for VLLM Server ---
             env['VLLM_USE_MODELSCOPE'] = 'True'
             self.logger.info(f"VLLM_USE_MODELSCOPE environment variable set for VLLM server process for model {self.model_name}.")
-            # Ensure 'trust_remote_code' and 'revision' are handled.
-            # 'trust_remote_code' will be added as a command line arg if present in vllm_config.
-            # 'revision' will also be added as a command line arg if present in vllm_config.
             # --- End ModelScope Integration ---
 
 
@@ -258,27 +209,27 @@ class VLLMServer:
             if self._cuda_devices: # Check if specific GPUs were pre-selected based on availability
                 num_available_selected = len(self._cuda_devices)
                 if num_available_selected < tp_size:
-                    # Not enough available/selected GPUs to meet the requirement
                     error_msg = (f"Configuration requires tensor_parallel_size={tp_size}, "
                                  f"but only {num_available_selected} suitable GPUs ({self._cuda_devices}) were found/selected. "
                                  f"Cannot start VLLM server for {self.model_name}.")
                     self.logger.error(error_msg)
                     raise RuntimeError(error_msg)
+                gpus_to_use = self._cuda_devices[:tp_size]
+                if gpus_to_use:
+                    env['CUDA_VISIBLE_DEVICES'] = ",".join(map(str, gpus_to_use))
+                    env['CUDA_DEVICE_ORDER'] = "PCI_BUS_ID"
+                    self.logger.info(f"Selected {tp_size} GPU(s) {gpus_to_use} from available list {self._cuda_devices} to match tensor_parallel_size.")
                 else:
-                    # Select the first tp_size GPUs from the pre-selected list
-                    gpus_to_use = self._cuda_devices[:tp_size]
-                    # Only set CUDA_VISIBLE_DEVICES if _cuda_devices is not empty,
-                    # otherwise let VLLM handle it (e.g. for CPU execution or full auto selection)
-                    if gpus_to_use:
-                        env['CUDA_VISIBLE_DEVICES'] = ",".join(map(str, gpus_to_use))
-                        env['CUDA_DEVICE_ORDER'] = "PCI_BUS_ID" # Ensure consistent ordering
-                        self.logger.info(f"Selected {tp_size} GPU(s) {gpus_to_use} from available list {self._cuda_devices} to match tensor_parallel_size.")
-                    else:
-                        self.logger.info("No specific GPUs pre-selected or list was empty. VLLM/CUDA will manage GPU allocation.")
-
-            else: # _cuda_devices is None or empty
-                # Let VLLM/CUDA handle GPU selection based on tp_size. Do not set env vars.
+                    self.logger.info("No specific GPUs pre-selected or list was empty. VLLM/CUDA will manage GPU allocation.")
+            else:
                 self.logger.info("No specific GPUs pre-selected. VLLM/CUDA will manage GPU allocation based on tensor_parallel_size.")
+
+            # 应用 YAML 中的环境变量覆盖（YAML 优先级最高）
+            if self._env_overrides:
+                for k, v in self._env_overrides.items():
+                    env[str(k)] = str(v)
+                if 'CUDA_VISIBLE_DEVICES' in self._env_overrides:
+                    self.logger.info("CUDA_VISIBLE_DEVICES specified in YAML env; overriding any auto-selection.")
 
             cmd_list = [sys.executable, '-m', 'vllm.entrypoints.openai.api_server', '--model', self.model_name]
 
@@ -323,7 +274,6 @@ class VLLMServer:
             os.makedirs(model_log_dir, exist_ok=True)
 
             # Get current timestamp for log file name
-            import datetime
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
             # Log file path will be determined after PID is known
@@ -346,14 +296,14 @@ class VLLMServer:
                 # Open log file for writing
                 log_handle = open(log_file, 'w')
 
-                # 为避免子进程被意外杀死，禁用 PDEATHSIG 行为
+                # 无特殊 preexec 设置
                 preexec = None
                 self.process = subprocess.Popen(
                     cmd_list,
                     env=env,
-                    shell=False, # MUST be False for preexec_fn
-                    start_new_session=True, # Creates independent process group
-                    preexec_fn=preexec, # Ensure child gets SIGKILL if parent dies (Linux)
+                    shell=False,
+                    start_new_session=True,
+                    preexec_fn=preexec,
                     stdout=log_handle, # Redirect stdout
                     stderr=log_handle  # Redirect stderr to same file
                 )

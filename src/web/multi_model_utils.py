@@ -133,6 +133,12 @@ def get_or_create_model(model_name: str) -> VLLMServer | None:
     获取或创建VLLMServer实例。
     使用全局锁保护整个方法执行过程，确保线程安全。
     
+    核心设计原则：
+    1. 只有创建者可以修改模型池条目
+    2. 等待者只读取，不修改
+    3. 创建者在 finally 中必须通知所有等待者
+    4. 失败状态的条目可以被重新创建
+    
     Args:
         model_name (str): 要获取或创建的模型名称标识符
 
@@ -144,33 +150,13 @@ def get_or_create_model(model_name: str) -> VLLMServer | None:
     # 先在锁内进行快速路径与占位，再在锁外执行耗时创建
     create_event: Optional[threading.Event] = None
     am_creator = False
-    server_to_kill: Optional[VLLMServer] = None
+    wait_event: Optional[threading.Event] = None
+    
     with model_global_lock:
-        # 已存在条目：需要判断健康状态
-        if model_name in model_pool:
-            entry = model_pool[model_name]
-            server_instance = entry.get("server")
-            # 情况A：正在创建中 -> 等待
-            if entry.get("creating") and isinstance(entry.get("event"), threading.Event):
-                create_event = None
-            # 情况B：有实例则直接复用（懒健康策略），失败由调用方处理
-            elif isinstance(server_instance, VLLMServer):
-                entry["last_access"] = datetime.now()
-                logger.info(f"返回现有的服务器实例: {model_name}")
-                return server_instance
-            else:
-                # 条目无效：转入创建路径
-                logger.warning(f"模型 {model_name} 的池条目无效，重新创建")
-                create_event = threading.Event()
-                model_pool[model_name] = {
-                    "creating": True,
-                    "event": create_event,
-                    "last_access": datetime.now(),
-                    "pinned": False,
-                }
-                am_creator = True
-        else:
-            # 不存在：放置占位，开始创建
+        entry = model_pool.get(model_name)
+        
+        if entry is None:
+            # 情况1：模型不存在，我们是创建者
             logger.info(f"模型 {model_name} 不存在于池中，放置占位并开始创建新实例")
             create_event = threading.Event()
             model_pool[model_name] = {
@@ -180,45 +166,67 @@ def get_or_create_model(model_name: str) -> VLLMServer | None:
                 "pinned": False,
             }
             am_creator = True
+        elif entry.get("creating") is True:
+            # 情况2：正在创建中，我们是等待者
+            event_obj = entry.get("event")
+            if isinstance(event_obj, threading.Event):
+                wait_event = event_obj
+                logger.info(f"模型 {model_name} 正在被其他线程创建，当前线程将等待")
+            else:
+                # 异常状态：creating=True 但没有 event，不应该发生
+                logger.error(f"模型 {model_name} 处于异常状态（creating=True但无event），返回失败")
+                return None
+        elif isinstance(entry.get("server"), VLLMServer):
+            # 情况3：已有有效实例，直接复用
+            entry["last_access"] = datetime.now()
+            logger.info(f"返回现有的服务器实例: {model_name}")
+            return entry["server"]
+        else:
+            # 情况4：条目存在但无效（可能是 FAILED 状态或其他异常），可以重新创建
+            logger.warning(f"模型 {model_name} 的池条目无效或已失败（{entry.get('status', 'UNKNOWN')}），重新创建")
+            create_event = threading.Event()
+            # 保留 pinned 状态
+            old_pinned = entry.get("pinned", False)
+            model_pool[model_name] = {
+                "creating": True,
+                "event": create_event,
+                "last_access": datetime.now(),
+                "pinned": old_pinned,
+            }
+            am_creator = True
 
-    if not am_creator:
-        # 说明存在占位但不是我们创建，等待他人创建结果
-        wait_event: Optional[threading.Event] = None
+    # ===== 等待者路径 =====
+    if wait_event is not None:
+        logger.info(f"等待其他线程完成模型 {model_name} 的创建（最多5分钟）")
+        triggered = wait_event.wait(timeout=300)
+        if not triggered:
+            logger.warning(f"等待模型 {model_name} 创建超时（5分钟）")
+        
+        # 等待结束后读取结果（只读，不修改）
         with model_global_lock:
             entry = model_pool.get(model_name)
-            if entry and entry.get("creating") and isinstance(entry.get("event"), threading.Event):
-                wait_event = entry["event"]
-        if wait_event:
-            # 最多等待5分钟，避免永久卡死
-            wait_event.wait(timeout=300)
-        # 创建完成后读取结果
-        with model_global_lock:
-            entry = model_pool.get(model_name)
-            if not entry:
-                logger.error(f"模型 {model_name} 创建占位结束但条目缺失")
+            if entry is None:
+                logger.error(f"模型 {model_name} 等待结束但条目缺失")
                 return None
             server_instance = entry.get("server")
             if isinstance(server_instance, VLLMServer):
                 entry["last_access"] = datetime.now()
+                logger.info(f"等待完成，返回由其他线程创建的模型实例: {model_name}")
                 return server_instance
-            logger.error(f"模型 {model_name} 创建失败或无效条目: {entry}")
-            # 清理无效占位
-            try:
-                del model_pool[model_name]
-            except KeyError:
-                pass
+            # 创建失败，返回 None（不删除条目，让后续请求可以重试）
+            logger.error(f"模型 {model_name} 创建失败，等待线程返回 None: status={entry.get('status')}, error={entry.get('error')}")
             return None
+    
+    # ===== 异常检查 =====
+    if not am_creator:
+        logger.error(f"模型 {model_name} 逻辑异常：既不是创建者也没有等待事件")
+        return None
 
-    # 锁外：如果需要，先关闭失效的旧实例，避免GPU/端口占用导致重复启动
-    if server_to_kill is not None:
-        try:
-            logger.info(f"Attempting to kill stale server before recreate: {model_name}")
-            server_to_kill.kill_server()
-        except Exception as e:
-            logger.error(f"Error killing stale server for {model_name}: {e}")
-
-    # 我们负责创建的路径：锁外执行耗时操作
+    # ===== 创建者路径 =====
     server_instance: VLLMServer | None = None
+    result_server: VLLMServer | None = None
+    pre_reserved: Optional[list[int]] = None
+    
     try:
         # 若 YAML 已指定 CUDA_VISIBLE_DEVICES，则跳过自动 GPU 预留
         yaml_has_cuda = _yaml_specifies_cuda(model_name)
@@ -226,25 +234,22 @@ def get_or_create_model(model_name: str) -> VLLMServer | None:
         if tp_size < 1:
             tp_size = 1
 
-        pre_reserved: Optional[list[int]] = None
         if not yaml_has_cuda:
             pre_reserved = _reserve_gpus_for_start(model_name, tp_size)
             if not pre_reserved:
                 logger.error(f"未找到适合模型 {model_name} 的GPU，无法创建服务器")
-                with model_global_lock:
-                    model_pool[model_name] = {
-                        "status": "FAILED",
-                        "error": "NO_SUITABLE_GPU",
-                        "last_access": datetime.now()
-                    }
-                return None
+                # 标记失败，但保留 event 以便通知等待者
+                # 注意：不在这里 return，让 finally 统一通知
+                raise RuntimeError("NO_SUITABLE_GPU")
             logger.info(f"为模型 {model_name} 在GPU {pre_reserved} 上创建VLLMServer（按 tp_size={tp_size} 预留）")
         else:
             logger.info(f"检测到 YAML 指定 CUDA_VISIBLE_DEVICES，跳过自动 GPU 预留以使用 YAML 环境配置。")
 
-        # 根据是否预留传入 cuda 参数（None 表示让子进程依 YAML/系统环境决定）
+        # 创建 VLLMServer 实例
         server_instance = VLLMServer(model_name, cuda=pre_reserved)
-        if (server_instance and server_instance.pid and server_instance.port and server_instance.client):
+        
+        if server_instance and server_instance.pid and server_instance.port and server_instance.client:
+            # 创建成功
             with model_global_lock:
                 existing_pinned = False
                 try:
@@ -258,55 +263,59 @@ def get_or_create_model(model_name: str) -> VLLMServer | None:
                     "unhealthy_count": 0,
                     "pinned": existing_pinned,
                 }
-                # 通知等待者
-                create_event.set()
-            # 启动成功后释放预留（此时进程已占用显存，不再需要“软预留”）
+            # 启动成功后释放预留（此时进程已占用显存，不再需要"软预留"）
             if pre_reserved:
                 _release_reserved_gpus(pre_reserved)
+                pre_reserved = None  # 标记已释放，避免 finally 重复释放
             logger.info(f"VLLMServer创建成功: {model_name} (PID: {server_instance.pid}, Port: {server_instance.port})")
-            return server_instance
+            result_server = server_instance
         else:
+            # 创建失败：实例无效
             logger.error(f"VLLMServer初始化失败: {model_name} (PID/Port/Client检查失败)")
             if server_instance and hasattr(server_instance, 'kill_server'):
                 try:
                     server_instance.kill_server()
                 except Exception as kill_e:
                     logger.error(f"清理失败服务器实例时出错: {model_name}: {kill_e}")
-            with model_global_lock:
-                model_pool[model_name] = {
-                    "status": "FAILED",
-                    "error": "INIT_VALIDATION_FAILED",
-                    "last_access": datetime.now()
-                }
-            if pre_reserved:
-                _release_reserved_gpus(pre_reserved)
-            return None
+            raise RuntimeError("INIT_VALIDATION_FAILED")
+            
     except Exception as e:
-        logger.error(f"创建VLLMServer时发生异常: {model_name}: {e}")
+        error_msg = str(e)
+        logger.error(f"创建VLLMServer时发生异常: {model_name}: {error_msg}")
+        
+        # 清理可能残留的服务器实例
         if server_instance and hasattr(server_instance, 'kill_server'):
             try:
                 server_instance.kill_server()
             except Exception as kill_e:
                 logger.error(f"异常处理时清理服务器失败: {model_name}: {kill_e}")
-        # 标记失败
+        
+        # 标记失败状态
         with model_global_lock:
             model_pool[model_name] = {
                 "status": "FAILED",
-                "error": str(e),
-                "last_access": datetime.now()
+                "error": error_msg,
+                "last_access": datetime.now(),
             }
-        # 异常同样释放预留
-        try:
-            _release_reserved_gpus(pre_reserved)
-        except Exception:
-            pass
-        return None
+        
+        # 释放预留的 GPU
+        if pre_reserved:
+            try:
+                _release_reserved_gpus(pre_reserved)
+            except Exception:
+                pass
+            pre_reserved = None
+            
     finally:
-        # 无论成功失败，都应通知等待者结束等待
-        try:
-            create_event.set()
-        except Exception:
-            pass
+        # 无论成功失败，都必须通知等待者结束等待
+        if create_event is not None:
+            try:
+                create_event.set()
+                logger.info(f"已通知等待线程：模型 {model_name} 创建流程结束（结果: {'成功' if result_server else '失败'}）")
+            except Exception as notify_err:
+                logger.error(f"通知等待线程时出错 {model_name}: {notify_err}")
+    
+    return result_server
 
 def idle_cleaner():
     """

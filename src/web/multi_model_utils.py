@@ -373,11 +373,16 @@ def cleanup_inactive_models():
                 now = datetime.now()
                 inactive_models = []
                 for model_name, entry in model_pool.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("creating") or entry.get("status") == "FAILED":
+                        continue
                     # 跳过被固定的（不自动卸载）模型
                     if entry.get("pinned"):
                         continue
                     # Check only valid VLLMServer instances
-                    if isinstance(entry["server"], VLLMServer):
+                    server_instance = entry.get("server")
+                    if isinstance(server_instance, VLLMServer):
                         if now - entry["last_access"] > timedelta(minutes=MODEL_TTL_MINUTES):
                             inactive_models.append(model_name)
 
